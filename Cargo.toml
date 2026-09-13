@@ -2,7 +2,7 @@
 name = "rust-kvm"
 version = "0.1.0"
 edition = "2024"
-# src/bin/probe.rs 是诊断工具，cargo run 默认跑服务端
+# src/bin/probe*.rs 都是诊断工具，cargo run 默认跑服务端
 default-run = "rust-kvm"
 
 [dependencies]
@@ -21,6 +21,9 @@ rcgen = "0.14.10"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serialport = "4.10.1"
+# 解 MJPEG 给编码器喂 NV12。纯 Rust，不引外部 DLL；直出 YCbCr 可以省掉色彩矩阵。
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
 tracing = "0.1.44"
@@ -30,6 +33,16 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 # 只为了 timeBeginPeriod：Windows 默认 15.6ms 的定时器精度会把串口轮询卡死在
 # 64Hz，键鼠往返直接多出十几毫秒。详见 serial_bridge.rs 里的说明。
 windows-sys = { version = "0.61.2", features = ["Win32_Media"] }
+# H.264 编码走 Media Foundation。这里非用带包装的 windows crate 不可：MFT 全是 COM
+# 接口，而 windows-sys 给的是裸 vtable，手写 QueryInterface 和引用计数不值得。
+windows = { version = "0.62.2", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    # 编码器参数（低延迟、B 帧数、码率模式）走 ICodecAPI::SetValue，值是 VARIANT，
+    # 而 VARIANT 同时挂在 Ole 和 Variant 两个 feature 后面，少一个就编译不出来。
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
 # 注册成服务跑在 session 0。除了开机自启，这也是唯一能看到物理音频端点的办法：
 # 远程桌面会话里那些端点会被换成「远程音频」。详见 service.rs。
 windows-service = "0.8.0"
