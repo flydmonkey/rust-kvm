@@ -13,6 +13,13 @@
         [640, 360]
     ];
     const FPS = [30, 25, 20, 15, 10];
+    const CODECS = [
+        {value: "mjpeg", label: "MJPEG（延迟最低）"},
+        {value: "h264", label: "H.264（省带宽）"}
+    ];
+    // 固定几档，不做自适应。理由见低带宽模式的设计文档：链路好坏在这个场景里
+    // 是已知的（在家还是在外面），一个开关比一套猜带宽的算法可靠。
+    const BITRATES = [1000, 2000, 4000, 8000];
     const BAUD_RATES = [9600, 115200];
     const LIVE_POLL_MS = 2000;
 
@@ -21,8 +28,11 @@
     const videoDevice = el("video-device");
     const videoSize = el("video-size");
     const videoFps = el("video-fps");
+    const videoCodec = el("video-codec");
+    const videoBitrate = el("video-bitrate");
     const audioDevice = el("audio-device");
     const audioEnabled = el("audio-enabled");
+    const audioNarrowband = el("audio-narrowband");
     const serialPort = el("serial-port");
     const serialBaud = el("serial-baud");
     const mouseMode = el("mouse-mode");
@@ -109,19 +119,31 @@
         showProblem("serial-problem", devices.serial.error);
     }
 
+    // 码率只对 H.264 有意义。留着能点但不起作用的控件，比灰掉更让人困惑。
+    function renderBitrateState() {
+        videoBitrate.disabled = videoCodec.value !== "h264";
+    }
+
     function renderConfig() {
         selectDevice(videoDevice, config.video.device);
         selectOrKeep(videoSize, `${config.video.width}x${config.video.height}`);
         selectOrKeep(videoFps, String(config.video.fps));
+        selectOrKeep(videoCodec, config.video.codec);
+        selectOrKeep(videoBitrate, String(config.video.bitrateKbps));
+        renderBitrateState();
 
         selectDevice(audioDevice, config.audio.device);
         audioEnabled.checked = config.audio.enabled;
+        audioNarrowband.checked = config.audio.narrowband;
 
         selectOrKeep(serialPort, config.serial.port);
         selectOrKeep(serialBaud, String(config.serial.baudRate));
         mouseMode.value = config.serial.mouseMode;
     }
 
+    // **每个字段都要列全。** 服务端那边所有字段都是 `serde(default)`，漏掉一个不会
+    // 报错，而是被悄悄重置成默认值——加了 codec 和 bitrateKbps 之后，这里漏写就等于
+    // 「在设置页保存任何一项，都会把 H.264 关掉」。
     function collect() {
         const [width, height] = videoSize.value.split("x").map(Number);
         return {
@@ -129,11 +151,14 @@
                 device: videoDevice.value,
                 width: width,
                 height: height,
-                fps: Number(videoFps.value)
+                fps: Number(videoFps.value),
+                codec: videoCodec.value,
+                bitrateKbps: Number(videoBitrate.value)
             },
             audio: {
                 device: audioDevice.value,
-                enabled: audioEnabled.checked
+                enabled: audioEnabled.checked,
+                narrowband: audioNarrowband.checked
             },
             serial: {
                 port: serialPort.value,
@@ -423,8 +448,14 @@
 
     fill(videoSize, SIZES.map(([w, h]) => ({value: `${w}x${h}`, label: `${w} × ${h}`})));
     fill(videoFps, FPS.map((fps) => ({value: String(fps), label: `${fps} fps`})));
+    fill(videoCodec, CODECS);
+    fill(
+        videoBitrate,
+        BITRATES.map((kbps) => ({value: String(kbps), label: `${kbps / 1000} Mbps`}))
+    );
     fill(serialBaud, BAUD_RATES.map((rate) => ({value: String(rate), label: String(rate)})));
 
+    videoCodec.addEventListener("change", renderBitrateState);
     saveButton.addEventListener("click", save);
     reloadButton.addEventListener("click", load);
     el("chip-read").addEventListener("click", readChip);

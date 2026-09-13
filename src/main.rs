@@ -414,6 +414,10 @@ async fn ws_audio(ws: WebSocketUpgrade, State(state): State<AppState>) -> Respon
 
 /// 先一条 Text 说明采样率和声道，随后每条 Binary 都是一块 Int16 LE 裸 PCM。
 /// 头必须严格早于第一块 PCM，否则客户端不知道按什么采样率建 AudioContext。
+///
+/// 格式中途会变（设置页开关窄带音频），所以和 `/ws/video` 一样是个循环：格式变了
+/// 就**重发一条头**并重建播放端，不断开连接。只发一次头是不行的——客户端会拿
+/// 48k 立体声的参数去播 24k 单声道的字节，听起来是变调加噼啪，而且没有任何报错。
 async fn stream_audio(socket: WebSocket, hub: Arc<AudioHub>) {
     // 先订阅，让采集开起来；格式要等采集真的打开才知道
     let mut chunks = hub.subscribe();
@@ -424,58 +428,102 @@ async fn stream_audio(socket: WebSocket, hub: Arc<AudioHub>) {
     // 连接看起来永远不断，设备也就一直开着。
     let mut reader = tokio::spawn(async move { while let Some(Ok(_)) = receiver.next().await {} });
 
-    let format = tokio::select! {
-        _ = &mut reader => return,
-        format = audio::await_format(&hub, &mut format_rx) => format,
-    };
-    let format = match format {
-        Ok(format) => format,
-        Err(message) => {
-            info!("音频开不起来: {message}");
-            let payload = serde_json::json!({"op": "error", "message": message});
-            let _ = sender.send(Message::Text(payload.to_string().into())).await;
-            reader.abort();
-            return;
-        }
-    };
-
-    let header = serde_json::json!({
-        "op": "format",
-        "sampleRate": format.sample_rate,
-        "channels": format.channels,
-        "format": "s16le",
-    });
-    if sender
-        .send(Message::Text(header.to_string().into()))
-        .await
-        .is_err()
-    {
-        reader.abort();
-        return;
-    }
-
-    // 等格式期间已经积了一点 PCM，这里先丢掉：那些是「头之前」的声音，
-    // 留着只会让播放起点白白多出一段延迟。
-    while chunks.try_recv().is_ok() {}
+    // 已经发出去的格式。**采音每重起一次这个循环就会转一圈**（设备打嗝、热插拔
+    // 恢复都算），而那些多数是同一个格式；重发一条一样的头会让客户端白白关掉再
+    // 新建一次 AudioContext，那是一段听得见的空白。所以只在真的变了时才发。
+    let mut sent: Option<audio::AudioFormat> = None;
 
     loop {
-        tokio::select! {
+        let format = tokio::select! {
             _ = &mut reader => break,
-            chunk = chunks.recv() => match chunk {
-                Ok(chunk) => {
-                    if sender.send(Message::Binary(chunk)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(RecvError::Lagged(skipped)) => {
-                    debug!("音频客户端落后，丢掉 {skipped} 块");
-                }
-                Err(RecvError::Closed) => break,
-            },
+            format = audio::await_format(&hub, &mut format_rx) => format,
+        };
+        let format = match format {
+            Ok(format) => format,
+            Err(message) => {
+                info!("音频开不起来: {message}");
+                let payload = serde_json::json!({"op": "error", "message": message});
+                let _ = sender.send(Message::Text(payload.to_string().into())).await;
+                break;
+            }
+        };
+
+        if sent != Some(format) {
+            let header = serde_json::json!({
+                "op": "format",
+                "sampleRate": format.sample_rate,
+                "channels": format.channels,
+                "format": "s16le",
+            });
+            if sender
+                .send(Message::Text(header.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            sent = Some(format);
+        }
+
+        // 等格式期间已经积了一点 PCM，这里先丢掉。第一次是因为那些是「头之前」的
+        // 声音，留着只会让播放起点白白多出一段延迟；换格式那次更要紧——积压里可能
+        // 还有**旧格式**的字节，按新头去播就是一段噪音。
+        drain(&mut chunks);
+
+        if pump_audio(&mut sender, &mut reader, &mut chunks, &mut format_rx).await == PumpEnd::Done {
+            break;
         }
     }
 
     reader.abort();
+}
+
+#[derive(PartialEq, Eq)]
+enum PumpEnd {
+    /// 连接没了，收摊
+    Done,
+    /// 格式变了，回去重发头
+    FormatChanged,
+}
+
+async fn pump_audio(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reader: &mut tokio::task::JoinHandle<()>,
+    chunks: &mut tokio::sync::broadcast::Receiver<bytes::Bytes>,
+    format_rx: &mut watch::Receiver<Option<audio::AudioFormat>>,
+) -> PumpEnd {
+    loop {
+        tokio::select! {
+            _ = &mut *reader => return PumpEnd::Done,
+            _ = format_rx.changed() => return PumpEnd::FormatChanged,
+            chunk = chunks.recv() => match chunk {
+                Ok(chunk) => {
+                    if sender.send(Message::Binary(chunk)).await.is_err() {
+                        return PumpEnd::Done;
+                    }
+                }
+                // 音频丢块就是一声爆音，但落后了更不能追——追只会让延迟一直挂着
+                Err(RecvError::Lagged(skipped)) => {
+                    debug!("音频客户端落后，丢掉 {skipped} 块");
+                }
+                Err(RecvError::Closed) => return PumpEnd::Done,
+            },
+        }
+    }
+}
+
+/// 丢到真的空了为止。
+///
+/// `Lagged` 不代表空——它只是说「中间丢了一些」，后面还有。拿 `is_ok()` 当条件的话
+/// 会在这儿提前收手，而这个函数存在的意义正是「一个旧字节都不留」。
+fn drain(chunks: &mut tokio::sync::broadcast::Receiver<bytes::Bytes>) {
+    use tokio::sync::broadcast::error::TryRecvError;
+    loop {
+        match chunks.try_recv() {
+            Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 async fn audio_stats(State(state): State<AppState>) -> Json<AudioStats> {

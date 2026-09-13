@@ -100,6 +100,10 @@
     }
 
     async function buildPlayer(incoming) {
+        // 格式中途会变（设置页的窄带音频开关），这时会重进这个函数。旧的一套必须
+        // 先关掉，理由见 closePlayer。
+        closePlayer();
+
         // AudioContext 直接按采集的采样率建，这样 worklet 收到的样本率就等于
         // 上下文率，一点重采样都不用做。真和硬件不符时浏览器会在输出端重采样，
         // 那是它的活儿，比我手写的强。
@@ -204,8 +208,20 @@
         }
         if (message.op === "format") {
             lastError = null;
-            format = {sampleRate: message.sampleRate, channels: message.channels};
+            const incoming = {sampleRate: message.sampleRate, channels: message.channels};
+            // 服务端在**每次**采音重起之后都会重发头（设备打嗝、热插拔恢复都算），
+            // 而那些多数是同一个格式。格式没变就别重建播放端：重建要关掉再新建
+            // AudioContext，那是一段听得见的空白，为一条重复的头付这个代价不值。
+            const same =
+                node &&
+                format &&
+                format.sampleRate === incoming.sampleRate &&
+                format.channels === incoming.channels;
+            format = incoming;
             render();
+            if (same) {
+                return;
+            }
             buildPlayer(format).catch((e) => {
                 lastError = `播放端建不起来：${e.message}`;
                 render();
@@ -275,13 +291,22 @@
             ws.onmessage = null;
             ws.close();
         }
+        closePlayer();
+        disarmGesture();
+    }
+
+    // 只拆 AudioContext 那一套。换格式时要用：服务端开关窄带音频之后会重发一条
+    // 头，旧的上下文必须关掉——不关的话每次换格式漏一个，而浏览器对同时存在的
+    // AudioContext 有数量上限（Chrome 是 6），到顶之后 new AudioContext 直接抛，
+    // 表现是「切了几次窄带就再也没声音了」。旧上下文还连着扬声器，不关也会和新的
+    // 一起响一小段。
+    function closePlayer() {
         if (node) {
             node.port.onmessage = null;
             node.disconnect();
             node = null;
         }
         recordDestination = null;
-        disarmGesture();
         if (context) {
             context.onstatechange = null;
             context.close();

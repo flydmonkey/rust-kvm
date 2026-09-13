@@ -188,8 +188,19 @@
                 <select id="video-fps"></select>
             </div>
         </div>
-        <p class="hint">服务端会协商到最接近的可用组合，实际生效的值看下面一行。
-            远程链路带宽不够时，降分辨率比降帧率更管用。</p>
+        <div class="field">
+            <label for="video-codec">编码</label>
+            <div class="pair">
+                <select id="video-codec"></select>
+                <select id="video-bitrate"></select>
+            </div>
+        </div>
+        <p class="hint">MJPEG 每帧独立、延迟最低，但 1080p30 要 16-45 Mbps，只够局域网走。
+            H.264 在宿主机上硬件编码，<strong>画面不动时几乎不占带宽</strong>（实测静止桌面
+            0.02 Mbps），代价是多一层编解码；带宽是瓶颈时才开它。码率只对 H.264 有意义，
+            是动起来时的上限。</p>
+        <p class="hint">切换编码不用刷新控制页，也不会断开连接。浏览器不支持 H.264 解码
+            或宿主机没有编码器时会自动退回 MJPEG，原因显示在控制页的连接信息里。</p>
         <p class="live" id="video-live">读取中…</p>
     </section>
 
@@ -204,8 +215,15 @@
             <input id="audio-enabled" type="checkbox">
             <label for="audio-enabled">允许采音（关掉后控制页的声音开关会直接报错）</label>
         </div>
+        <div class="checkline">
+            <input id="audio-narrowband" type="checkbox">
+            <label for="audio-narrowband">窄带音频（单声道 24 kHz，带宽降到四分之一）</label>
+        </div>
         <p class="hint">括号里是设备自报的采样率和声道数。采集卡的音频口通常不叫
             「麦克风」，认这两个数字比认名字可靠。</p>
+        <p class="hint">裸 PCM 是 1.5 Mbps，在远程链路上和 H.264 的画面差不多贵。窄带降到
+            384 kbps，代价是 12 kHz 以上的高频没了——听系统声和人说话察觉不出来，听音乐
+            能听出闷一点。只对 48 kHz 的源生效；改了要在控制页重连声音。</p>
         <p class="live" id="audio-live">读取中…</p>
     </section>
 

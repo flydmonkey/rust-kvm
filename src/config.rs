@@ -61,6 +61,11 @@ pub struct AudioSettings {
     /// 关掉之后 `/ws/audio` 直接回一条错误，采集根本不会打开。
     /// 和客户端那个声音开关是两回事：这个是「服务端允不允许」。
     pub enabled: bool,
+    /// 单声道 24 kHz，带宽降到四分之一（1.5 Mbps → 384 kbps）。
+    ///
+    /// 只对 48 kHz 的源生效。被控机的系统声单声道完全够用，而在 5 Mbps 的
+    /// 预算里裸 PCM 那 1.5 Mbps 占了三成——省下来的是 H.264 之外最大的一块。
+    pub narrowband: bool,
 }
 
 impl Default for AudioSettings {
@@ -68,6 +73,8 @@ impl Default for AudioSettings {
         Self {
             device: "Digital Audio Interface".to_string(),
             enabled: true,
+            // 和 codec 同一个道理：日常是局域网，窄带是出门时才开的
+            narrowband: false,
         }
     }
 }

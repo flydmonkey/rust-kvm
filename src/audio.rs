@@ -327,6 +327,35 @@ fn hdmi_stereo_quirk(reported: AudioFormat) -> Option<AudioFormat> {
 /// 整条流开头要丢掉的样本数。
 const QUIRK_SKIP: usize = 1;
 
+/// 窄带只对 48 kHz 的源生效，别的采样率原样放过。
+///
+/// 卡在 48k 上不是偷懒：2:1 抽取只要一个定点滤波器，任意比率就得上正经的重采样器。
+/// 而这条路上只有 48k 一种源（采集卡的 HDMI 音频），为一个不存在的情形写重采样器
+/// 是纯粹的负担。真遇到别的采样率就说一句、照原样发——**不静默地什么都不做**。
+fn narrowband_format(actual: AudioFormat, wanted: bool) -> (AudioFormat, Option<Narrowband>) {
+    if !wanted {
+        return (actual, None);
+    }
+    if actual.sample_rate != 48_000 {
+        warn!(
+            "设置里开了窄带音频，但源是 {} Hz 而不是 48000 Hz，这一档只支持 48k，按原格式发",
+            actual.sample_rate
+        );
+        return (actual, None);
+    }
+    info!(
+        "窄带音频：{} Hz {} 声道 → 24000 Hz 单声道",
+        actual.sample_rate, actual.channels
+    );
+    (
+        AudioFormat {
+            sample_rate: 24_000,
+            channels: 1,
+        },
+        Some(Narrowband::new()),
+    )
+}
+
 /// 维持帧对齐。cpal 每次回调给的样本数不定，开头丢掉一个之后每块的奇偶都会错开，
 /// 所以落单的那个样本要留到下一块开头，否则左右声道会来回互换。
 ///
@@ -362,18 +391,102 @@ impl FrameAlign {
     }
 }
 
-/// `align` 为 `None` 时原样发（设备自报的格式可信），否则先对齐帧边界。
-fn publish_aligned(
-    hub: &AudioHub,
-    align: &mut Option<FrameAlign>,
-    samples: impl Iterator<Item = i16>,
-    count: usize,
-) {
-    match align {
-        None => hub.publish(samples, count),
-        Some(align) => {
-            let aligned = align.align(samples);
-            hub.publish(aligned.iter().copied(), aligned.len());
+/// 窄带：多声道 48 kHz → 单声道 24 kHz，字节数降到四分之一。
+///
+/// **降采样前必须先低通**，否则 12 kHz 以上的内容会折回可听频段。那种失真听起来
+/// 是"发毛、发沙"，而且不会让人想到是采样率的问题——比带宽不够难查得多。
+///
+/// 用 `[1,3,3,1]/8`：直流增益正好是 1（不用管溢出和音量变化），在 24 kHz 处正好是
+/// 零点（抽取后折回直流的那个频率被彻底掐掉）。四个抽头显然不如正经的窗函数 FIR，
+/// 但它在回调里只要三次加法和一次移位，而被控机的系统声在 12 kHz 以上本来就没什么
+/// 东西——为这点内容上一套更重的滤波器不值。
+struct Narrowband {
+    /// 滤波器要看前三个样本，而一次回调的边界不该影响结果，所以跨回调留着
+    history: [i32; 3],
+    /// 2:1 抽取的相位。同样要跨回调保持：每次回调给的样本数不定，
+    /// 每块都从头数的话相位会乱跳，表现是音高不稳
+    keep: bool,
+    /// 攒不满一帧的那几个声道。cpal 正常按整帧给，但这个状态一留就不必去赌，
+    /// 而赌输的代价是从此左右声道一直错位
+    partial: (i32, usize),
+    buf: Vec<i16>,
+}
+
+impl Narrowband {
+    fn new() -> Self {
+        Self {
+            history: [0; 3],
+            keep: true,
+            partial: (0, 0),
+            buf: Vec::new(),
+        }
+    }
+
+    /// 交织的多声道样本进，单声道半采样率出。
+    fn process(&mut self, samples: impl Iterator<Item = i16>, channels: usize) -> &[i16] {
+        self.buf.clear();
+        let (mut sum, mut have) = self.partial;
+        for sample in samples {
+            sum += sample as i32;
+            have += 1;
+            if have < channels {
+                continue;
+            }
+            // 各声道取平均。立体声是主要情形，但按声道数算就不用假设只有两路
+            let mono = sum / channels as i32;
+            sum = 0;
+            have = 0;
+
+            let [h0, h1, h2] = self.history;
+            let filtered = (h0 + 3 * h1 + 3 * h2 + mono) / 8;
+            self.history = [h1, h2, mono];
+            if self.keep {
+                // 上面的增益是 1，源本来就在 i16 范围内，所以这里不会截断；
+                // clamp 只是为了万一（比如将来改了系数）不至于回绕成爆音
+                self.buf.push(filtered.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+            }
+            self.keep = !self.keep;
+        }
+        self.partial = (sum, have);
+        &self.buf
+    }
+}
+
+/// 样本发出去之前要过的几步。哪几步生效由设备和配置决定——帧对齐只有 MS2109
+/// 那个 quirk 要，窄带只有设置里开了才要——所以都是 `Option`，两条采音路径
+/// （真设备和测试音源）共用同一条管线。
+struct Pipeline {
+    align: Option<FrameAlign>,
+    narrowband: Option<Narrowband>,
+    /// 进入窄带那一步时的声道数，也就是设备**实际**的声道数（quirk 之后的）
+    channels: usize,
+}
+
+impl Pipeline {
+    fn publish(&mut self, hub: &AudioHub, samples: impl Iterator<Item = i16>, count: usize) {
+        // 分别借用两个字段：`align` 的返回值借着它的缓冲，此时还要 `narrowband`
+        // 的可变借用，整体借 `self` 会过不了
+        let Self {
+            align,
+            narrowband,
+            channels,
+        } = self;
+
+        match (align, narrowband) {
+            (None, None) => hub.publish(samples, count),
+            (Some(align), None) => {
+                let aligned = align.align(samples);
+                hub.publish(aligned.iter().copied(), aligned.len());
+            }
+            (None, Some(narrow)) => {
+                let narrowed = narrow.process(samples, *channels);
+                hub.publish(narrowed.iter().copied(), narrowed.len());
+            }
+            (Some(align), Some(narrow)) => {
+                let aligned = align.align(samples);
+                let narrowed = narrow.process(aligned.iter().copied(), *channels);
+                hub.publish(narrowed.iter().copied(), narrowed.len());
+            }
         }
     }
 }
@@ -399,10 +512,12 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
         channels: supported.channels(),
     };
     let sample_format = supported.sample_format();
+    // 下一行会把 `config` 这个名字让给 cpal 的流配置，所以要的设置先取出来
+    let narrowband_wanted = config.narrowband;
     let config = supported.config();
 
     // 设备自报的格式可能是假的，见 hdmi_stereo_quirk
-    let (format, mut align) = match hdmi_stereo_quirk(reported) {
+    let (actual, align) = match hdmi_stereo_quirk(reported) {
         Some(actual) => {
             info!(
                 "设备自报 {} Hz {} 声道，按 {} Hz {} 声道解（MS2109 的交织立体声）",
@@ -411,6 +526,13 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
             (actual, Some(FrameAlign::new(QUIRK_SKIP)))
         }
         None => (reported, None),
+    };
+    // 窄带要放在 quirk 之后：它按**实际**的声道数降混，而 quirk 之前那个声道数是假的
+    let (format, narrowband) = narrowband_format(actual, narrowband_wanted);
+    let mut pipeline = Pipeline {
+        align,
+        narrowband,
+        channels: actual.channels as usize,
     };
 
     let error_hub = hub.clone();
@@ -429,14 +551,14 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
         error_hub.mark_stream_dead(format!("音频流已失效: {e}"));
     };
 
-    // 声道数和采样率照设备自报的来，不在这儿重采样：客户端的 AudioContext
-    // 可以直接按这个采样率建，浏览器的重采样比我手写的强。
+    // 除了窄带那一档，采样率和声道数都照设备自报的来，不在这儿重采样：客户端的
+    // AudioContext 可以直接按这个采样率建，浏览器的重采样比我手写的强。
     let data_hub = hub.clone();
     let stream = match sample_format {
         SampleFormat::I16 => device.build_input_stream(
             config,
             move |data: &[i16], _: &_| {
-                publish_aligned(&data_hub, &mut align, data.iter().copied(), data.len())
+                pipeline.publish(&data_hub, data.iter().copied(), data.len())
             },
             on_error,
             None,
@@ -445,7 +567,7 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
             config,
             move |data: &[f32], _: &_| {
                 let samples = data.iter().map(|s| f32_to_i16(*s));
-                publish_aligned(&data_hub, &mut align, samples, data.len())
+                pipeline.publish(&data_hub, samples, data.len())
             },
             on_error,
             None,
@@ -454,7 +576,7 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
             config,
             move |data: &[i32], _: &_| {
                 let samples = data.iter().map(|s| (*s >> 16) as i16);
-                publish_aligned(&data_hub, &mut align, samples, data.len())
+                pipeline.publish(&data_hub, samples, data.len())
             },
             on_error,
             None,
@@ -533,14 +655,30 @@ fn tone_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
     /// 别开满，出声就行，免得谁一点开关就被吓一跳
     const AMPLITUDE: f32 = 0.15;
 
+    // 和 capture_loop 一样先清标志。漏了这一下的后果是**无限重启**：set_config 置位
+    // 之后没人清，循环一进来就看到「要重开」，立刻返回，supervise 再把它拉起来……
+    // 一直转。以前没人盯格式变化，所以这个空转是静悄悄的；现在每转一圈会重发一条
+    // 格式头，直接变成刷屏。
+    hub.reconfigured.store(false, Ordering::SeqCst);
+
     let frames = (RATE as u128 * CHUNK.as_millis() / 1000) as usize;
-    hub.mark_capturing(
-        true,
-        Some(AudioFormat {
+    // 也走真设备那条管线。音源是 48k 立体声，正好能把窄带那一档验到——
+    // 否则窄带就只能等有音频设备的机器上手测，而这个音源存在的意义就是
+    // 把「设备能不能开」和「管线对不对」分开。
+    let narrowband_wanted = hub.config.lock().expect("config 锁").narrowband;
+    let (format, narrowband) = narrowband_format(
+        AudioFormat {
             sample_rate: RATE,
             channels: CHANNELS,
-        }),
+        },
+        narrowband_wanted,
     );
+    let mut pipeline = Pipeline {
+        align: None,
+        narrowband,
+        channels: CHANNELS as usize,
+    };
+    hub.mark_capturing(true, Some(format));
     info!("采音用的是测试音源（{TONE_ENV} 已设），{TONE_HZ} Hz 正弦");
 
     let mut phase = 0.0f32;
@@ -567,7 +705,7 @@ fn tone_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
             }
         }
         let count = samples.len();
-        hub.publish(samples.into_iter(), count);
+        pipeline.publish(&hub, samples.into_iter(), count);
 
         if hub.reconfigured.load(Ordering::SeqCst) {
             return Ok(StopReason::Reconfigured);
@@ -637,5 +775,108 @@ pub async fn await_format(
                 .fatal_error()
                 .unwrap_or_else(|| "音频采集没能在 5 秒内启动".to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 交织立体声进、单声道半采样率出，所以字节数是四分之一——这个比例就是整档
+    /// 「窄带」的全部收益，写成断言免得哪天顺手改了滤波器把它弄丢。
+    #[test]
+    fn 窄带把样本数降到四分之一() {
+        let mut narrow = Narrowband::new();
+        // 100 帧立体声 = 200 个样本
+        let input: Vec<i16> = (0..200).map(|_| 1000).collect();
+        let out = narrow.process(input.iter().copied(), 2);
+        assert_eq!(out.len(), 50, "100 帧立体声应当出 50 个单声道样本");
+    }
+
+    /// 直流增益必须正好是 1。系数和不是 8 的话整体音量就变了，而音量变化很容易
+    /// 被当成"设备问题"而不是"我们改错了滤波器"。
+    #[test]
+    fn 直流不改变幅度() {
+        let mut narrow = Narrowband::new();
+        let input: Vec<i16> = vec![8000; 2000];
+        let out = narrow.process(input.iter().copied(), 2);
+        // 开头几个样本还在滤波器的暖机段，取后半段看稳态
+        let tail = &out[out.len() / 2..];
+        for sample in tail {
+            assert_eq!(*sample, 8000, "稳态下直流应当原样通过");
+        }
+    }
+
+    /// 这一条是滤波器存在的**唯一理由**：24 kHz（抽取后正好折回直流）必须被掐掉。
+    /// 不滤直接抽取的话，这个信号会变成一个满幅的直流偏移——听起来是"咚"一声加
+    /// 持续的失真，而且完全不会让人想到是采样率的问题。
+    #[test]
+    fn 奈奎斯特处的信号被滤掉() {
+        let mut narrow = Narrowband::new();
+        // 48k 下 +A,-A,+A,-A… 就是 24 kHz。立体声，两个声道同相
+        let input: Vec<i16> = (0..2000)
+            .map(|i| if (i / 2) % 2 == 0 { 10000 } else { -10000 })
+            .collect();
+        let out = narrow.process(input.iter().copied(), 2);
+        let tail = &out[out.len() / 2..];
+        for sample in tail {
+            assert_eq!(*sample, 0, "24 kHz 处应当是零点");
+        }
+    }
+
+    /// 左右声道要降混成平均，不是只取左声道——只取一路的话，声音只出现在一边的
+    /// 内容会整段消失。
+    #[test]
+    fn 左右声道取平均() {
+        let mut narrow = Narrowband::new();
+        // 左声道满、右声道静音，平均应当是一半
+        let input: Vec<i16> = (0..2000)
+            .map(|i| if i % 2 == 0 { 10000 } else { 0 })
+            .collect();
+        let out = narrow.process(input.iter().copied(), 2);
+        let tail = &out[out.len() / 2..];
+        for sample in tail {
+            assert_eq!(*sample, 5000, "应当是两个声道的平均");
+        }
+    }
+
+    /// 抽取相位和滤波器历史都要跨调用保持。不保持的话每块都从相位 0 重新开始，
+    /// 表现是音高发飘——而分块长度由 cpal 决定，本地测不出来。
+    #[test]
+    fn 分块处理和一次处理结果相同() {
+        let input: Vec<i16> = (0..400).map(|i| ((i * 37) % 2000 - 1000) as i16).collect();
+
+        let mut whole = Narrowband::new();
+        let expected = whole.process(input.iter().copied(), 2).to_vec();
+
+        let mut chunked = Narrowband::new();
+        let mut got = Vec::new();
+        // 故意切成奇数长度，让帧边界也落在块中间
+        for chunk in input.chunks(7) {
+            got.extend_from_slice(chunked.process(chunk.iter().copied(), 2));
+        }
+        assert_eq!(got, expected, "分块和整块必须给出完全一样的结果");
+    }
+
+    /// 只有 48 kHz 的源走窄带。别的采样率要原样放过，而不是按 2:1 抽一刀
+    /// ——那会让音高变成原来的两倍。
+    #[test]
+    fn 只有_48k_的源才降采样() {
+        let source = AudioFormat {
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let (format, narrow) = narrowband_format(source, true);
+        assert_eq!(format, source, "非 48k 的源应当原样发");
+        assert!(narrow.is_none());
+
+        let source = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let (format, narrow) = narrowband_format(source, true);
+        assert_eq!(format.sample_rate, 24_000);
+        assert_eq!(format.channels, 1);
+        assert!(narrow.is_some());
     }
 }
