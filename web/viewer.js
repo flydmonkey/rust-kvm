@@ -13,6 +13,8 @@ const statsTip = document.getElementById("stats-tip");
 let clientStats = null;
 let serverStats = null;
 let connection = "连接中";
+// 服务端本来要发 h264 却回落了 MJPEG 的原因，由 Worker 从编码头里带出来
+let fallbackReason = null;
 
 // 画布尺寸要在移交给 Worker 之前定好：控制权一旦转移，就不能再改这个元素的
 // width/height 了。所以先问服务端当前采集的分辨率，拿不到就按 1080p 兜底。
@@ -34,6 +36,12 @@ function websocketUrl(path) {
     return `${scheme}//${location.host}${path}`;
 }
 
+// 一位小数对 MJPEG 够用（44.7），但对 H.264 会把静止画面的码率显示成 0.0——
+// 而「不动的桌面几乎不要钱」恰恰是这个功能最大的收益，不能让它看起来像没数。
+function formatMbps(mbps) {
+    return mbps < 1 ? mbps.toFixed(2) : mbps.toFixed(1);
+}
+
 function render() {
     const lines = [`连接      ${connection}`];
 
@@ -51,11 +59,22 @@ function render() {
     }
 
     if (clientStats) {
+        // 编码必须写出来：两种编码的码率差一个数量级，看读数时得知道现在是哪种
+        const h264 = clientStats.codec === "h264";
         lines.push(
-            `本机收到  ${clientStats.received} 帧  ${clientStats.mbps.toFixed(1)} Mbps`,
-            `本机绘制  ${clientStats.drawn} 帧  解码 ${clientStats.decodeMs.toFixed(1)} ms`,
+            `编码      ${h264 ? "H.264" : "MJPEG"}${h264 ? `  解码队列 ${clientStats.decodeQueue}` : ""}`,
+            `本机收到  ${clientStats.received} 帧  ${formatMbps(clientStats.mbps)} Mbps`,
+            // H.264 的解码在解码器里异步做，主线程掐不到表，所以那一栏不报
+            h264
+                ? `本机绘制  ${clientStats.drawn} 帧`
+                : `本机绘制  ${clientStats.drawn} 帧  解码 ${clientStats.decodeMs.toFixed(1)} ms`,
             `到帧→绘制 ${clientStats.latencyMs.toFixed(1)} ms`
         );
+        if (fallbackReason) {
+            // 服务端本来要发 h264 但编码器起不来。这一条必须显示——静默退回 MJPEG
+            // 的话，人只会觉得「省带宽那个开关没用」，而不知道为什么。
+            lines.push(`已回落 MJPEG  ${fallbackReason}`);
+        }
         // 丢帧不一定是坏事：解码跟不上到帧时故意丢掉旧帧，保证看到的是最新画面
         if (clientStats.dropped > 0 || clientStats.errors > 0) {
             lines.push(`丢帧      ${clientStats.dropped}  解码失败 ${clientStats.errors}`);
@@ -146,6 +165,8 @@ async function start() {
             clientStats = message;
         } else if (message.type === "state") {
             connection = message.state;
+        } else if (message.type === "codec") {
+            fallbackReason = message.fallbackReason;
         }
         render();
     };
