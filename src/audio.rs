@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat};
+use cpal::{Device, ErrorKind, SampleFormat};
 use tokio::sync::{Notify, broadcast, watch};
 use tracing::{info, warn};
 
@@ -33,6 +33,12 @@ const IDLE_GRACE: Duration = Duration::from_secs(3);
 /// 采集线程多久检查一次「还有没有人听」。音频回调在另一个线程上跑，
 /// 这个线程只是替 cpal 的 Stream 守着生命周期，醒得勤一点也不费什么。
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 有人听却这么久一个数据块都没来，就认定流已经停摆，收摊重建。
+///
+/// 块是十几毫秒一个，三秒足够宽松，不会误伤正常的流；又足够短，恢复不至于
+/// 让人以为坏了。
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `/ws/audio` 等采集把格式报上来的上限。超过就认为开不起来，回一条错误，
 /// 让页面显示原因而不是干等。
@@ -100,6 +106,9 @@ pub struct AudioHub {
     wake: Notify,
     capturing: AtomicBool,
     stats: Mutex<StatsInner>,
+    /// cpal 的错误回调判定流已失效时写在这儿，采音循环下一轮轮询就收摊。
+    /// 不放进 `stats` 是因为它不是给人看的读数，而是控制流。
+    stream_dead: Mutex<Option<String>>,
 }
 
 impl AudioHub {
@@ -114,6 +123,7 @@ impl AudioHub {
             wake: Notify::new(),
             capturing: AtomicBool::new(false),
             stats: Mutex::new(StatsInner::default()),
+            stream_dead: Mutex::new(None),
         });
         tokio::spawn(supervise(hub.clone()));
         hub
@@ -222,6 +232,19 @@ impl AudioHub {
     /// 「未采音 0 kbps」，而人明明还听得到声音——最难查的那种状态不一致。
     fn record_stream_error(&self, message: String) {
         self.stats.lock().expect("stats 锁").stream_error = Some(message);
+    }
+
+    /// 流死了，采音循环该收摊重建。
+    ///
+    /// 从 cpal 的错误回调（另一个线程）跨到采音循环，所以只能放个标志等它来取。
+    fn mark_stream_dead(&self, message: String) {
+        *self.stream_dead.lock().expect("stream_dead 锁") = Some(message);
+    }
+
+    /// 取走并清空。**必须取走**：留着的话下一轮刚建好的流会被上一轮的死讯
+    /// 立刻杀掉，然后一秒一次无限重建。同一类坑在 `stream_error` 上踩过一次了。
+    fn take_stream_dead(&self) -> Option<String> {
+        self.stream_dead.lock().expect("stream_dead 锁").take()
     }
 
     /// 只给 `await_format` 用：它要判断的是「采音能不能起来」，答案只能由
@@ -358,6 +381,9 @@ fn publish_aligned(
 fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
     // 先清标志再读配置，理由同 video.rs
     hub.reconfigured.store(false, Ordering::SeqCst);
+    // 上一轮的死讯到这儿一律作废。不清的话新流一建好就被它立刻杀掉，然后
+    // 一秒一轮无限重建——和 `stream_error` 那次陈旧消息是同一类坑。
+    hub.take_stream_dead();
     let config = hub.config.lock().expect("config 锁").clone();
     if !config.enabled {
         bail!("音频已在设置里关掉了");
@@ -389,8 +415,18 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
 
     let error_hub = hub.clone();
     let on_error = move |e: cpal::Error| {
-        warn!("音频流错误: {e}");
         error_hub.record_stream_error(format!("音频流错误: {e}"));
+        // 瞬时的只有这两种：Xrun 是欠载/溢出，流还在跑；DeviceChanged 是音频
+        // 路由变了、cpal 已经自己重定向好了，文档明说不用重建。**其余一律当致命**
+        // ——未知错误按致命处理最坏是白重建一次流（声音断一下就回来），按瞬时
+        // 处理则会永久假活：页面显示在采音、字节数不动、没有任何错误，而且永远
+        // 不会自己恢复。两种猜错的代价差得太远。
+        if matches!(e.kind(), ErrorKind::Xrun | ErrorKind::DeviceChanged) {
+            warn!("音频流错误（瞬时）: {e}");
+            return;
+        }
+        warn!("音频流已失效: {e}");
+        error_hub.mark_stream_dead(format!("音频流已失效: {e}"));
     };
 
     // 声道数和采样率照设备自报的来，不在这儿重采样：客户端的 AudioContext
@@ -435,25 +471,48 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
     );
 
     let mut idle_since: Option<Instant> = None;
-    let reason = loop {
+    let mut last_chunks = hub.stats.lock().expect("stats 锁").chunks;
+    let mut last_progress = Instant::now();
+
+    let outcome = loop {
         std::thread::sleep(POLL_INTERVAL);
 
         if hub.reconfigured.load(Ordering::SeqCst) {
-            break StopReason::Reconfigured;
+            break Ok(StopReason::Reconfigured);
+        }
+        if let Some(message) = hub.take_stream_dead() {
+            break Err(anyhow::anyhow!(message));
         }
         if hub.chunks.receiver_count() == 0 {
             let since = idle_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= IDLE_GRACE {
-                break StopReason::Idle;
+                break Ok(StopReason::Idle);
             }
-        } else {
-            idle_since = None;
+            // 没人听的时候不采数据也正常，别让下面的停摆检查误判
+            last_progress = Instant::now();
+            continue;
+        }
+        idle_since = None;
+
+        // 有人听却一个块都不来，说明流已经停了。这一条是兜底：WASAPI 上设备被
+        // 拔掉时 cpal 不一定报错，回调可能只是再也不被调用——那正是最坏的失败
+        // 形态，页面显示在采音、读数不动、永远不会自己恢复。输入流即使源是静音
+        // 也会持续送缓冲，所以「三秒一个块都没有」不会误伤正常的流。
+        let chunks = hub.stats.lock().expect("stats 锁").chunks;
+        if chunks != last_chunks {
+            last_chunks = chunks;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= STALL_TIMEOUT {
+            break Err(anyhow::anyhow!(
+                "音频流停摆：{} 秒没有收到数据（设备可能被拔了）",
+                STALL_TIMEOUT.as_secs()
+            ));
         }
     };
 
     // drop 就是停流，显式写出来是为了让「到这儿才停」这件事看得见
     drop(stream);
-    Ok(reason)
+    outcome
 }
 
 fn f32_to_i16(sample: f32) -> i16 {

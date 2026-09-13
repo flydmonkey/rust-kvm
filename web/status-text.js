@@ -67,7 +67,10 @@ var StatusText = (function () {
             return {level: "idle", lines: ["未连接串口"]};
         }
         if (state.serialLost) {
-            return {level: "error", lines: ["串口已断开", "插回 CH9329 后会自动重连", "或点此立即重试"]};
+            // 接下来那句提示（在自动重连 / 可以点着连）由调用方补：只有它知道
+            // 现在有没有排上下一次尝试。这儿曾经写死「插回后会自动重连」，
+            // 而当时根本没有重连代码——一句纯粹的空话。
+            return {level: "error", lines: ["串口已断开"]};
         }
 
         var level = "ok";

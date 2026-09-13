@@ -29,6 +29,16 @@
     // 串口被别的控制端占着（或者我们刚被接管）。这个状态和「连不上」要分开：
     // 它的解法不是重试，而是接管。
     let busy = false;
+    // 自动重连的定时器。非 null 就是「已经排上了下一次尝试」
+    let reconnectTimer = null;
+    // 是不是正处在「掉线后自动重连」这个过程里。不能只看 serialLost：connect()
+    // 一开头就把它清零，那样一次失败的尝试之后循环就自己停了。
+    let reconnecting = false;
+    // 最近一次连接失败的原因。重连期间要一直显示着——光一句「正在重连」的话，
+    // 「为什么还没连上」这个唯一想知道的事就没了。
+    let lastFailure = null;
+    // 重连间隔。CH9329 拔插后要几秒才重新枚举出来，太密只是白试
+    const RECONNECT_DELAY_MS = 3000;
 
     function websocketUrl(path) {
         const scheme = location.protocol === "https:" ? "wss:" : "ws:";
@@ -75,12 +85,27 @@
         } else if (ch && !serialLost) {
             // 延迟读数只在连着时有意义，而且要跟在固件信息后面
             lines.push(...latencyLines, "点击刷新芯片状态");
+        } else if (reconnectTimer) {
+            // describeSerial 那句「插回 CH9329 后会自动重连」曾经是句空话——
+            // 当时根本没有重连代码。现在有了，这里把「正在等下一次」说出来，
+            // 免得看上去只是躺着不动。
+            if (lastFailure) {
+                lines.push(lastFailure);
+            }
+            lines.push("正在自动重连…", "或点此立即重试");
         } else {
             lines.push(portName ? `点击连接 ${portName}` : "点击连接");
         }
 
-        // 被占用是黄的，不是红的：设备一切正常，只是控制权在别人手上
-        const level = busy ? "warn" : state.level;
+        // 被占用是黄的，不是红的：设备一切正常，只是控制权在别人手上。
+        // 重连期间是红的：describeSerial 此刻只看到「没连上」（灰），但我们知道
+        // 这是掉线之后还没接回来，不是「还没点过连接」。
+        let level = state.level;
+        if (busy) {
+            level = "warn";
+        } else if (reconnectTimer) {
+            level = "error";
+        }
         StatusText.applyStatus(statusButton, statusTip, {level: level, lines: lines});
         statusButton.setAttribute("aria-label", label());
     }
@@ -121,20 +146,30 @@
     }
 
     // 定下要开哪个口。没有下拉框了，所以这里必须自己得出一个确定的答案。
-    async function resolvePort() {
+    //
+    // `quiet` 给自动重连用：那条路自己会把「正在等下一次」显示出来，这儿再覆盖
+    // 一句「点这里重试」只会自相矛盾。
+    async function resolvePort(quiet) {
         let ports = [];
         try {
             const response = await fetch("/api/serial/ports", {cache: "no-store"});
             ports = await response.json();
         } catch (e) {
-            renderStatus({
-                level: "error",
-                lines: ["读不到串口列表", String(e.message || e), "点击重试"]
-            });
+            if (!quiet) {
+                renderStatus({
+                    level: "error",
+                    lines: ["读不到串口列表", String(e.message || e), "点击重试"]
+                });
+            }
             return;
         }
         if (!ports.length) {
-            renderStatus({level: "error", lines: ["宿主机上没有串口", "插上 CH9329 后点这里重试"]});
+            if (!quiet) {
+                renderStatus({
+                    level: "error",
+                    lines: ["宿主机上没有串口", "插上 CH9329 后点这里重试"]
+                });
+            }
             return;
         }
 
@@ -149,6 +184,54 @@
             portName = (usb || ports[0]).name;
         }
         renderStatus();
+    }
+
+    // 掉线后自动重连。CH9329 断电重插是设置页写完波特率之后的**必经**步骤，而键鼠
+    // 本来就默认连接——插回来还要人手点一下并不合理。服务端的视频和音频也是这么
+    // 守着的（出错等一秒再来），这里只是把同一条规矩补给串口。
+    function scheduleReconnect() {
+        // busy 是被别人接管了，**绝不能**自动抢回来：那样两个开着的页面会互相
+        // 抢到没完。要抢必须是人点的。
+        if (reconnectTimer || connecting || busy) {
+            return;
+        }
+        if (!serialLost && !reconnecting) {
+            return;
+        }
+        reconnecting = true;
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (busy) {
+                reconnecting = false;
+                return;
+            }
+            // 每次都重新问一遍串口列表：拔插之后 Windows 偶尔会重新分配口号，
+            // 死盯着旧名字会永远连不上
+            portName = null;
+            loadSettings()
+                .then(() => resolvePort(true))
+                .then(() => (portName ? connect(false) : undefined))
+                .catch(() => {
+                    // 失败原因由 connect 自己写在图标上，这儿只负责排下一次
+                })
+                .finally(() => {
+                    if (!ch || serialLost) {
+                        scheduleReconnect();
+                    }
+                });
+        }, RECONNECT_DELAY_MS);
+        renderStatus();
+    }
+
+    // 连上了，或者人接手了。定时器必须清掉：留着的话它迟些醒来，会在人刚手动
+    // 连好之后又插一脚。
+    function cancelReconnect() {
+        reconnecting = false;
+        lastFailure = null;
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
     }
 
     async function teardown() {
@@ -203,6 +286,7 @@
                 ch.markDisconnected();
             }
             renderStatus();
+            scheduleReconnect();
         };
         port.onserviceerror = (error) => {
             // 被别人接管走的也是这条路。这时不能报「串口已中断」——设备好着，
@@ -222,6 +306,7 @@
                 ch.markDisconnected();
             }
             renderStatus({level: "error", lines: ["串口已中断", error.message]});
+            scheduleReconnect();
         };
 
         try {
@@ -236,8 +321,10 @@
             ch.onTransportError = () => {
                 serialLost = true;
                 renderStatus();
+                scheduleReconnect();
             };
             setAckWait(false);
+            cancelReconnect();
         } catch (error) {
             // 被拒的原因只在服务端那条 error 里。调用方拿到的往往是随后连接断开
             // 产生的「串口桥已断开」——更晚、更没信息量，正好把真正的原因盖住，
@@ -249,13 +336,17 @@
             await teardown();
             connecting = false;
             if (refused) {
+                // 被占用不该触发自动重连，那是抢；清掉是因为人点「接管」之后
+                // 我们不想还挂着一条旧的重连链
+                cancelReconnect();
                 busy = true;
                 renderStatus();
                 return;
             }
+            lastFailure = message;
             renderStatus({
                 level: "error",
-                lines: ["连接失败", message, "点击重试"]
+                lines: ["连接失败", message, reconnecting ? "正在自动重连…" : "点击重试"]
             });
             return;
         }
@@ -504,9 +595,12 @@
             refreshInfo();
             return;
         }
+        // 人接手了，自动重连那条链让位：不清的话它会在这次手动连接之后又插一脚
+        const takeover = busy;
+        cancelReconnect();
         // 只有明确点过的时候才抢。自动连接绝不抢：页面一打开就夺走别人的控制权，
         // 那是没人想要的行为，而且两个开着的标签页会互相抢到没完。
-        connect(busy).catch((error) => {
+        connect(takeover).catch((error) => {
             renderStatus({
                 level: "error",
                 lines: ["连接失败", String(error.message || error), "点击重试"]
