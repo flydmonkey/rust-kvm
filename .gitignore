@@ -16,3 +16,8 @@
 # probe-audio 的产物：录音和 session 0 那次探测的输出
 /audio-probe-*.wav
 /probe-session0.txt
+
+# probe-h264 --grab / --jpeg 的产物：抓的那一帧和转出来肉眼看的灰度图
+/frame.jpg
+/frame-y.pgm
+/frame-y.png

@@ -5,17 +5,49 @@
 //! NV12、能吐出 SPS」这三件事上，所以先用两百行确认，而不是写完一整条管线之后
 //! 才发现前提不成立。
 //!
-//! 跑：cargo run --bin probe-h264
+//! 三个模式：
+//!
+//! - `cargo run --bin probe-h264` —— 编码器探针（上面说的那件事）
+//! - `cargo run --bin probe-h264 -- --grab` —— 从采集卡抓一帧存成 `frame.jpg`
+//! - `cargo run --bin probe-h264 -- --jpeg frame.jpg` —— 解成 NV12，把 Y 平面存成
+//!   `frame-y.pgm` 肉眼看几何对不对
+//!
+//! 后两个模式是为了验 JPEG→NV12 那一步：单元测试只能证明算术对，证明不了接上真
+//! 采集卡出来的图是对的。**采集卡被服务占着时抓不到帧**，先 `rust-kvm.exe stop`。
 
 use anyhow::Result;
 
-#[cfg(not(windows))]
+// 二进制之间不能互相 use，所以直接把模块源码包进来。项目里的探针本来就是这个
+// 路数（各自独立、不进服务端），比为此新开一个 lib target 轻。
+//
+// 这个探针做成目录（`src/bin/probe-h264/main.rs`）而不是单文件，是因为 cargo 会把
+// `src/bin/` 下的**每个** .rs 都当成一个独立二进制——子模块放在那儿会因为「没有
+// main 函数」编译失败。
+#[path = "../../nv12.rs"]
+mod nv12;
+
+mod jpeg_probe;
+
 fn main() -> Result<()> {
-    anyhow::bail!("这个探针只在 Windows 上有意义");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--grab") => jpeg_probe::grab("frame.jpg"),
+        Some("--jpeg") => {
+            let path = args.get(1).map(String::as_str).unwrap_or("frame.jpg");
+            jpeg_probe::to_pgm(path, "frame-y.pgm")
+        }
+        Some(other) => anyhow::bail!("不认识的参数 {other}（只有 --grab 和 --jpeg）"),
+        None => encoder_probe(),
+    }
+}
+
+#[cfg(not(windows))]
+fn encoder_probe() -> Result<()> {
+    anyhow::bail!("编码器探针只在 Windows 上有意义");
 }
 
 #[cfg(windows)]
-fn main() -> Result<()> {
+fn encoder_probe() -> Result<()> {
     windows_probe::run()
 }
 
@@ -376,6 +408,10 @@ mod windows_probe {
             media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack(WIDTH, HEIGHT))?;
             media_type.SetUINT64(&MF_MT_FRAME_RATE, pack(FPS, 1))?;
             media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            // 采集卡的 JPEG 是满幅（实测彩条 Y 跑到 255 和 7，不是 235/16）。不说
+            // 明的话编码器按 studio swing 解释，解码端再展开一次——表现是黑的更黑
+            // 白的更白，颜色发飘，而这种毛病很难指着说出哪里不对。
+            media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32)?;
             transform
                 .SetInputType(0, &media_type, 0)
                 .context("SetInputType（若报 TYPE_NOT_SET，是输出类型没先设好）")?;

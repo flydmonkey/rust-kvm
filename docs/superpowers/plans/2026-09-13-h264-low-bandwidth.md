@@ -939,11 +939,21 @@ cargo test --lib h264
 3. **keyframe 标记**：从 `MFSampleExtension_CleanPoint` 属性读，
    或退一步用「包里含 SPS」判断。两者都写，前者拿不到时用后者。
 
-4. **`Drop`**：`ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM)` +
+4. **输入类型要标满幅**（`MF_MT_VIDEO_NOMINAL_RANGE = MFNominalRange_0_255`）。
+   Task 2 实测：采集卡彩条的 Y 跑到 255 和 7，不是 235/16。不标的话编码器按
+   studio swing 解释、解码端再展开一次，表现是黑的更黑白的更白、颜色发飘，
+   而这种毛病很难指着说出哪里不对。
+
+5. **`Drop`**：`ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM)` +
    `MFT_MESSAGE_COMMAND_DRAIN`，然后 `MFShutdown` 由进程级别管，不在这里调
    ——多个编码器实例轮换时调了会把别人一起关掉。
 
-5. **`MFStartup` 只能调一次**：用 `std::sync::Once` 包住。
+6. **`MFStartup` 只能调一次**：用 `std::sync::Once` 包住。
+
+7. **异步 MFT 只能由事件驱动**（Task 1 实测）：`ProcessOutput` 不等
+   `METransformHaveOutput` 就调，会以 `E_UNEXPECTED`（0x8000FFFF）失败。事件用
+   `MF_EVENT_FLAG_NO_WAIT` 轮询而不是阻塞式 `GetEvent`——事件不来时挂死比报错
+   难查得多。探针里那个 `run_async` 直接搬过来即可。
 
 - [ ] **Step 6: 用探针验证封装后的编码器**
 
