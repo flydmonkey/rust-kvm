@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="utf-8">
+    <title>rust-kvm</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* 画面按原始比例缩放到窗口内。用 max-* 而不是 object-fit，
+           后者在 canvas 上的支持不如前者稳。顺带一个好处：画布元素的
+           布局框正好等于画面内容框，ch9329.js 的绝对坐标换算不用改。 */
+        #screen {
+            display: block;
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        .overlay {
+            position: fixed;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background: rgba(24, 24, 27, 0.78);
+            backdrop-filter: blur(8px);
+            color: #e4e4e7;
+            font: 12px/1.6 ui-monospace, Consolas, monospace;
+        }
+
+        #stats {
+            top: 8px;
+            left: 8px;
+            white-space: pre;
+            pointer-events: none;
+        }
+
+        #stats.hidden {
+            display: none;
+        }
+
+        /* ---- 左侧浮动工具栏（布局照搬 chrome-kvm）----
+           浮在画面上、垂直居中。半透明毛玻璃比实心块少遮挡。 */
+        .floating-toolbar {
+            position: fixed;
+            top: 50%;
+            left: 0;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+            padding: 8px 7px;
+            background-color: rgba(24, 24, 27, 0.72);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-left: none;
+            border-radius: 0 12px 12px 0;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+            color: #e4e4e7;
+            z-index: 1000;
+            transition: transform 0.25s ease;
+        }
+
+        /* 收起时整条滑出屏幕，只留右侧那截把手 */
+        .floating-toolbar.hidden {
+            transform: translate(-100%, -50%);
+        }
+
+        .floating-toolbar button {
+            /* tooltip 要贴着按钮定位，少了这行会以整条工具栏为基准 */
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            padding: 0;
+            border: none;
+            border-radius: 10px;
+            background-color: transparent;
+            color: inherit;
+            cursor: pointer;
+            transition: background-color 0.15s, color 0.15s;
+        }
+
+        .floating-toolbar button:hover {
+            background-color: rgba(255, 255, 255, 0.12);
+        }
+
+        .floating-toolbar button:active {
+            background-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .floating-toolbar button:focus-visible {
+            outline: 2px solid #60a5fa;
+            outline-offset: -2px;
+        }
+
+        .floating-toolbar button:disabled {
+            color: #52525b;
+            cursor: default;
+            background-color: transparent;
+        }
+
+        .floating-toolbar button svg {
+            width: 20px;
+            height: 20px;
+            pointer-events: none;
+        }
+
+        /* 状态指示：灰=未连接，绿=正常，黄=可用但有问题，红=失败。
+           画面、键鼠、声音各一个。图标本身变色，不另占一行文字。 */
+        .status-indicator.status-idle {
+            color: #a1a1aa;
+        }
+
+        .status-indicator.status-ok {
+            color: #3ddc84;
+        }
+
+        .status-indicator.status-warn {
+            color: #ffc107;
+        }
+
+        .status-indicator.status-error {
+            color: #f87171;
+        }
+
+        /* 功能分组之间的细分隔线 */
+        .toolbar-divider {
+            width: 22px;
+            height: 1px;
+            margin: 4px 0;
+            background-color: rgba(255, 255, 255, 0.12);
+        }
+
+        /* 全屏按钮按当前状态切换图标 */
+        .icon-exit-fullscreen {
+            display: none;
+        }
+
+        body.is-fullscreen .icon-enter-fullscreen {
+            display: none;
+        }
+
+        body.is-fullscreen .icon-exit-fullscreen {
+            display: block;
+        }
+
+        /* 叠加层关掉之后图标也暗下来，否则看不出当前是开还是关 */
+        #toggle-stats.off {
+            color: #52525b;
+        }
+
+        /* 录制中必须一眼看得出来——忘了自己在录，磁盘会悄悄被填满 */
+        #record.recording {
+            color: #f87171;
+        }
+
+        .tooltip {
+            position: absolute;
+            top: 50%;
+            left: calc(100% + 10px);
+            transform: translateY(-50%);
+            background-color: rgba(24, 24, 27, 0.95);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            padding: 5px 9px;
+            font: 12px/1.5 system-ui, sans-serif;
+            white-space: pre;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        }
+
+        .tooltip::before {
+            content: "";
+            position: absolute;
+            top: 50%;
+            right: 100%;
+            transform: translateY(-50%);
+            border: 5px solid transparent;
+            border-right-color: rgba(24, 24, 27, 0.95);
+        }
+
+        .floating-toolbar button:hover .tooltip,
+        .floating-toolbar button:focus-visible .tooltip {
+            opacity: 1;
+        }
+
+        /* 显示/隐藏把手 */
+        .toggle-button {
+            width: 38px;
+            height: 26px;
+        }
+
+        /* 选择器要够具体才压得住上面的 .floating-toolbar button svg */
+        .floating-toolbar .toggle-button svg {
+            width: 16px;
+            height: 16px;
+            transition: transform 0.25s ease;
+        }
+
+        /* 收起状态下把手留在屏幕边缘，箭头翻个面 */
+        .floating-toolbar.hidden .toggle-button {
+            position: absolute;
+            top: 50%;
+            /* 100% 是内边距盒的右沿，加上 1px 边框才刚好贴住屏幕左边 */
+            left: calc(100% + 1px);
+            transform: translateY(-50%);
+            width: 18px;
+            height: 42px;
+            background-color: rgba(24, 24, 27, 0.72);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-left: none;
+            border-radius: 0 8px 8px 0;
+        }
+
+        .floating-toolbar.hidden .toggle-button svg {
+            transform: rotate(180deg);
+        }
+
+        .floating-toolbar.hidden .toggle-button .tooltip {
+            left: calc(100% + 8px);
+        }
+
+        /* 动作的结果提示。图标工具栏里塞不下一行文字，所以做成底部浮出的提示条。
+           chrome-kvm 这些用的是 alert()，那会打断操作，而且要多点一下才能继续。 */
+        #toast {
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            max-width: 70vw;
+            white-space: pre-wrap;
+            text-align: center;
+            z-index: 1000;
+            transition: opacity 0.2s;
+        }
+
+        #toast:empty {
+            display: none;
+        }
+
+        #toast.ok {
+            color: #4ade80;
+        }
+
+        #toast.warn {
+            color: #fbbf24;
+        }
+
+        #toast.error {
+            color: #f87171;
+        }
+    </style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="stats" class="overlay">正在连接…</div>
+<!-- 图标用内联 SVG：emoji 在各系统上渲染差异太大，且语义常对不上。
+     默认收起，只留右边那截把手——画面不该一上来就被挡住。
+
+     串口和鼠标模式不在这儿：那是开机配一次的东西，设置页里已经有了。 -->
+<div id="toolbar" class="floating-toolbar hidden">
+    <button id="video-status" class="status-indicator status-idle" type="button" aria-label="画面状态">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="6" width="14" height="12" rx="2"/>
+            <path d="M22 8l-6 4 6 4V8z"/>
+        </svg>
+        <span class="tooltip" id="video-status-tip">正在连接…</span>
+    </button>
+    <button id="input-status" class="status-indicator status-idle" type="button" aria-label="键鼠状态">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <rect x="1" y="8" width="14" height="10" rx="2"/>
+            <path d="M4 11.5h.01"/>
+            <path d="M7.5 11.5h.01"/>
+            <path d="M11 11.5h.01"/>
+            <path d="M4.5 14.5h6"/>
+            <rect x="17" y="6" width="6" height="12" rx="3"/>
+            <path d="M20 8.5v2"/>
+        </svg>
+        <span class="tooltip" id="input-status-tip">未连接串口</span>
+    </button>
+    <button id="audio-toggle" class="status-indicator status-idle" type="button" aria-label="声音">
+        <svg id="icon-audio-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+            <path d="M22 9l-6 6"/>
+            <path d="M16 9l6 6"/>
+        </svg>
+        <svg id="icon-audio-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" style="display: none" aria-hidden="true">
+            <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+            <path d="M15.5 8.5a5 5 0 0 1 0 7"/>
+            <path d="M19 5.5a9 9 0 0 1 0 13"/>
+        </svg>
+        <span class="tooltip" id="audio-status">声音已关闭</span>
+    </button>
+
+    <div class="toolbar-divider"></div>
+
+    <button id="toggle-stats" type="button" aria-label="连接信息">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M12 16.5v-5.5"/>
+            <path d="M12 7.5h.01"/>
+        </svg>
+        <span class="tooltip" id="stats-tip">隐藏连接信息</span>
+    </button>
+    <button id="fullscreen" type="button" aria-label="全屏">
+        <svg class="icon-enter-fullscreen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3"/>
+            <path d="M16 3h3a2 2 0 0 1 2 2v3"/>
+            <path d="M3 16v3a2 2 0 0 0 2 2h3"/>
+            <path d="M21 16v3a2 2 0 0 1-2 2h-3"/>
+        </svg>
+        <svg class="icon-exit-fullscreen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 3v3a2 2 0 0 1-2 2H3"/>
+            <path d="M21 8h-3a2 2 0 0 1-2-2V3"/>
+            <path d="M3 16h3a2 2 0 0 1 2 2v3"/>
+            <path d="M16 21v-3a2 2 0 0 1 2-2h3"/>
+        </svg>
+        <span class="tooltip" id="fullscreen-tip">全屏</span>
+    </button>
+    <button id="record" type="button" aria-label="录制">
+        <svg id="icon-record" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="7" fill="currentColor"/>
+        </svg>
+        <svg id="icon-stop" viewBox="0 0 24 24" style="display: none" aria-hidden="true">
+            <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/>
+        </svg>
+        <span class="tooltip" id="record-tip">录制（声音开着就一起录进去）</span>
+    </button>
+
+    <div class="toolbar-divider"></div>
+
+    <button id="ctrl-alt-del" type="button" aria-label="发送 Ctrl+Alt+Delete">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="4" width="20" height="16" rx="2"/>
+            <path d="M6 9h.01"/>
+            <path d="M10 9h.01"/>
+            <path d="M14 9h.01"/>
+            <path d="M18 9h.01"/>
+            <path d="M7 15h10"/>
+        </svg>
+        <span class="tooltip">Ctrl+Alt+Delete
+由芯片直接发给被控端
+和本机按了什么无关</span>
+    </button>
+    <button id="paste" type="button" aria-label="粘贴文本">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <rect x="8" y="2" width="8" height="4" rx="1"/>
+            <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+            <path d="M9 12h6"/>
+            <path d="M9 16h4"/>
+        </svg>
+        <span class="tooltip">粘贴文本
+逐字模拟按键，约 40ms 一个字符
+中文等非 US 键盘字符会被跳过</span>
+    </button>
+    <button id="release-all" type="button" aria-label="强制松开所有键">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="4" width="20" height="16" rx="2"/>
+            <path d="M6 9h.01"/>
+            <path d="M10 9h.01"/>
+            <path d="M7 15h10"/>
+            <path d="M3 3l18 18"/>
+        </svg>
+        <span class="tooltip">强制松开所有键
+被控端卡着按键不放时用</span>
+    </button>
+
+    <div class="toolbar-divider"></div>
+
+    <button id="open-settings" type="button" aria-label="设置">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        <span class="tooltip">设置</span>
+    </button>
+    <button id="reload" type="button" aria-label="刷新页面">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 2v6h-6"/>
+            <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+            <path d="M3 22v-6h6"/>
+            <path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+        </svg>
+        <span class="tooltip">刷新</span>
+    </button>
+
+    <div class="toolbar-divider"></div>
+
+    <!-- 默认是收起状态，所以初始文案是「展开」 -->
+    <button id="collapse" class="toggle-button" type="button" aria-label="展开工具栏">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <path d="M15 18l-6-6 6-6"/>
+        </svg>
+        <span class="tooltip" id="collapse-tip">展开</span>
+    </button>
+</div>
+
+<div id="toast" class="overlay"></div>
+<script src="ch9329.js"></script>
+<script src="status-text.js"></script>
+<script src="serial-ws.js"></script>
+<script src="viewer.js"></script>
+<script src="input.js"></script>
+<script src="audio.js"></script>
+<script src="toolbar.js"></script>
+</body>
+</html>

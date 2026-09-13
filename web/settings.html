@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="utf-8">
+    <title>rust-kvm 设置</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px 16px 64px;
+            background: #09090b;
+            color: #e4e4e7;
+            font: 14px/1.7 system-ui, "Microsoft YaHei", sans-serif;
+        }
+
+        main {
+            max-width: 680px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 20px;
+            margin: 0 0 4px;
+        }
+
+        .lede {
+            color: #a1a1aa;
+            margin: 0 0 24px;
+        }
+
+        a {
+            color: #60a5fa;
+        }
+
+        section {
+            border: 1px solid #27272a;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        h2 {
+            font-size: 15px;
+            margin: 0 0 12px;
+        }
+
+        .field {
+            display: grid;
+            grid-template-columns: 92px 1fr;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .field > label {
+            color: #a1a1aa;
+        }
+
+        select, input[type="text"] {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            background: #18181b;
+            color: #e4e4e7;
+            font: inherit;
+        }
+
+        /* 分辨率和帧率并排，它们是一件事的两半 */
+        .pair {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+        }
+
+        .checkline {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            color: #a1a1aa;
+        }
+
+        .hint {
+            color: #71717a;
+            font-size: 13px;
+            margin: 8px 0 0;
+        }
+
+        /* 枚举失败的原因——尤其音频那条远程桌面的解释——必须显眼，
+           否则用户只会看到一个空下拉框然后无从下手 */
+        .problem {
+            border: 1px solid #7f1d1d;
+            background: #1f1315;
+            color: #fca5a5;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin: 0 0 12px;
+        }
+
+        .problem:empty {
+            display: none;
+        }
+
+        .live {
+            color: #71717a;
+            font: 12px/1.6 ui-monospace, Consolas, monospace;
+            white-space: pre-wrap;
+            margin: 10px 0 0;
+        }
+
+        /* 不做成 sticky：它会盖住紧挨在上面的那排芯片按钮，点不着 */
+        .actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            padding: 4px 0 16px;
+        }
+
+        button {
+            padding: 8px 16px;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            background: #18181b;
+            color: #e4e4e7;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        button.primary {
+            background: #1d4ed8;
+            border-color: #1d4ed8;
+        }
+
+        button.danger {
+            border-color: #7f1d1d;
+            color: #fca5a5;
+        }
+
+        /* 四个按钮在窄屏上要能换行，别横着挤成一条 */
+        .chip-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 4px;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: default;
+        }
+
+        #save-status.ok, #chip-status.ok {
+            color: #4ade80;
+        }
+
+        #save-status.error, #chip-status.error {
+            color: #f87171;
+        }
+
+        /* 写芯片要断电重插才生效，这句提醒得比普通成功消息更抓眼 */
+        #chip-status.warn {
+            color: #fbbf24;
+        }
+    </style>
+</head>
+<body>
+<main>
+    <h1>rust-kvm 设置</h1>
+    <p class="lede">设备列表由宿主机枚举——远程浏览器没有本机的摄像头和串口权限。
+        <a href="/">返回控制页</a></p>
+
+    <section>
+        <h2>画面</h2>
+        <div class="problem" id="video-problem"></div>
+        <div class="field">
+            <label for="video-device">采集设备</label>
+            <select id="video-device"></select>
+        </div>
+        <div class="field">
+            <label for="video-size">分辨率</label>
+            <div class="pair">
+                <select id="video-size"></select>
+                <select id="video-fps"></select>
+            </div>
+        </div>
+        <p class="hint">服务端会协商到最接近的可用组合，实际生效的值看下面一行。
+            远程链路带宽不够时，降分辨率比降帧率更管用。</p>
+        <p class="live" id="video-live">读取中…</p>
+    </section>
+
+    <section>
+        <h2>声音</h2>
+        <div class="problem" id="audio-problem"></div>
+        <div class="field">
+            <label for="audio-device">采音设备</label>
+            <select id="audio-device"></select>
+        </div>
+        <div class="checkline">
+            <input id="audio-enabled" type="checkbox">
+            <label for="audio-enabled">允许采音（关掉后控制页的声音开关会直接报错）</label>
+        </div>
+        <p class="hint">括号里是设备自报的采样率和声道数。采集卡的音频口通常不叫
+            「麦克风」，认这两个数字比认名字可靠。</p>
+        <p class="live" id="audio-live">读取中…</p>
+    </section>
+
+    <section>
+        <h2>键鼠</h2>
+        <div class="problem" id="serial-problem"></div>
+        <div class="field">
+            <label for="serial-port">串口</label>
+            <select id="serial-port"></select>
+        </div>
+        <div class="field">
+            <label for="mouse-mode">鼠标模式</label>
+            <select id="mouse-mode">
+                <option value="absolute">绝对（推荐，指针位置一致）</option>
+                <option value="relative">相对（需要 Pointer Lock，适合游戏）</option>
+            </select>
+        </div>
+        <p class="hint">串口不热切换，下次在控制页点「连接键鼠」时生效。
+            相对模式需要芯片工作在模式 2，否则某些被控端点不动。</p>
+    </section>
+
+    <section>
+        <h2>CH9329 芯片</h2>
+        <p class="hint">这一节直接读写芯片，要临时借用串口——别处正连着时会问你要不要
+            接管。<strong>写入后都要把 CH9329 断电重插（拔掉 USB 再插回）才生效。</strong></p>
+        <div class="field">
+            <label for="serial-baud">波特率</label>
+            <select id="serial-baud"></select>
+        </div>
+        <div class="field">
+            <label for="working-mode">工作模式</label>
+            <select id="working-mode">
+                <option value="0">0：键盘 + 鼠标 + 自定义 HID（出厂默认）</option>
+                <option value="2">2：键盘 + 鼠标（Linux / Android / macOS 建议）</option>
+                <option value="1">1：仅键盘</option>
+                <option value="3">3：仅自定义 HID（无键鼠）</option>
+            </select>
+        </div>
+        <p class="hint">波特率被「保存」记进配置，当作连接时优先试的值；真实值仍由
+            <code>ch9329.js</code> 探测决定。工作模式<strong>只存在于芯片上</strong>，
+            「保存」不管它，只有「写入工作模式」才会改。</p>
+        <div class="chip-actions">
+            <button id="chip-read" type="button">读取芯片配置</button>
+            <button id="chip-baud" type="button">写入波特率</button>
+            <button id="chip-mode" type="button">写入工作模式</button>
+            <button id="chip-reset" type="button" class="danger">恢复出厂配置</button>
+        </div>
+        <p class="live" id="chip-status">还没读过芯片</p>
+    </section>
+
+    <div class="actions">
+        <button id="save" class="primary" type="button">保存</button>
+        <button id="reload" type="button">重新枚举设备</button>
+        <span id="save-status"></span>
+    </div>
+</main>
+<script src="serial-ws.js"></script>
+<script src="ch9329.js"></script>
+<script src="settings-page.js"></script>
+</body>
+</html>

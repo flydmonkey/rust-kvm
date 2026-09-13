@@ -1,0 +1,188 @@
+// 观看页的主线程部分：只负责把画布交给 Worker、轮询服务端状态、渲染叠加信息。
+// 解码和绘制全在 Worker 里，主线程留给后面要接的键鼠事件。
+
+const STATS_POLL_MS = 1000;
+
+const canvas = document.getElementById("screen");
+const statsEl = document.getElementById("stats");
+const statusButton = document.getElementById("video-status");
+const statusTip = document.getElementById("video-status-tip");
+const statsButton = document.getElementById("toggle-stats");
+const statsTip = document.getElementById("stats-tip");
+
+let clientStats = null;
+let serverStats = null;
+let connection = "连接中";
+
+// 画布尺寸要在移交给 Worker 之前定好：控制权一旦转移，就不能再改这个元素的
+// width/height 了。所以先问服务端当前采集的分辨率，拿不到就按 1080p 兜底。
+async function detectResolution() {
+    try {
+        const response = await fetch("/api/video/stats", {cache: "no-store"});
+        const stats = await response.json();
+        if (stats.resolution) {
+            return {width: stats.resolution[0], height: stats.resolution[1]};
+        }
+    } catch (e) {
+        // 服务端还没起来也无所谓，用兜底值先把画布建起来
+    }
+    return {width: 1920, height: 1080};
+}
+
+function websocketUrl(path) {
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${scheme}//${location.host}${path}`;
+}
+
+function render() {
+    const lines = [`连接      ${connection}`];
+
+    if (serverStats) {
+        const resolution = serverStats.resolution
+            ? `${serverStats.resolution[0]}x${serverStats.resolution[1]}`
+            : "未知";
+        lines.push(
+            `服务端    ${serverStats.fps.toFixed(1)} fps  ${serverStats.mbps.toFixed(1)} Mbps  ${resolution}`,
+            `观看者    ${serverStats.viewers}${serverStats.capturing ? "  采集中" : "  未采集"}`
+        );
+        if (serverStats.error) {
+            lines.push(`服务端错误 ${serverStats.error}`);
+        }
+    }
+
+    if (clientStats) {
+        lines.push(
+            `本机收到  ${clientStats.received} 帧  ${clientStats.mbps.toFixed(1)} Mbps`,
+            `本机绘制  ${clientStats.drawn} 帧  解码 ${clientStats.decodeMs.toFixed(1)} ms`,
+            `到帧→绘制 ${clientStats.latencyMs.toFixed(1)} ms`
+        );
+        // 丢帧不一定是坏事：解码跟不上到帧时故意丢掉旧帧，保证看到的是最新画面
+        if (clientStats.dropped > 0 || clientStats.errors > 0) {
+            lines.push(`丢帧      ${clientStats.dropped}  解码失败 ${clientStats.errors}`);
+        }
+    }
+
+    statsEl.textContent = lines.join("\n");
+
+    // 同样的信息在工具栏上还有一份浓缩版：叠加层收起来之后，那是唯一
+    // 还能看出画面通不通的地方
+    StatusText.applyStatus(statusButton, statusTip, StatusText.describeStream({
+        connection: connection,
+        serverStats: serverStats,
+        clientStats: clientStats
+    }));
+}
+
+// 连接信息叠加层的开关。原来这个动作藏在画面状态图标的点击里，只有 tooltip
+// 提一句，等于没有——开关这种东西该有自己的按钮。
+//
+// 不做快捷键：键盘一旦接管就全归被控机了，任何单键都可能是用户想按给对面的。
+function renderStatsToggle() {
+    const hidden = statsEl.classList.contains("hidden");
+    statsButton.classList.toggle("off", hidden);
+    statsTip.textContent = hidden ? "显示连接信息" : "隐藏连接信息";
+    statsButton.setAttribute("aria-label", hidden ? "显示连接信息" : "隐藏连接信息");
+}
+
+statsButton.addEventListener("click", () => {
+    statsEl.classList.toggle("hidden");
+    renderStatsToggle();
+});
+
+// 画面状态图标点一下立刻重读服务端读数。平时一秒一次，这个只是不想等那一秒
+// ——比如刚在设置页改了分辨率回来，想马上确认生效了没有。
+statusButton.addEventListener("click", () => {
+    pollServerStats();
+});
+
+async function pollServerStats() {
+    try {
+        const response = await fetch("/api/video/stats", {cache: "no-store"});
+        serverStats = await response.json();
+    } catch (e) {
+        serverStats = null;
+    }
+    render();
+}
+
+// 录制专用画布。不进 DOM，也不显示：它唯一的用途是给 captureStream() 当源。
+//
+// 显示用的那块画布已经交给 Worker 了，主线程对它 captureStream() 只能录到黑屏，
+// 而 OffscreenCanvas 没有 captureStream。所以录制单独走这一块，由 Worker 把
+// 解码好的帧转过来喂。不录的时候完全没有开销——Worker 那边连帧都不发。
+const recordCanvas = document.createElement("canvas");
+const recordContext = recordCanvas.getContext("2d", {alpha: false});
+let recordTrack = null;
+
+function onRecordFrame(bitmap) {
+    if (recordCanvas.width !== bitmap.width || recordCanvas.height !== bitmap.height) {
+        recordCanvas.width = bitmap.width;
+        recordCanvas.height = bitmap.height;
+    }
+    recordContext.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    // 手动模式：每收一帧录一帧。用自动模式的话帧的产生取决于画布有没有被
+    // 合成器绘制，而这块画布根本不在 DOM 里，不能指望。
+    if (recordTrack) {
+        recordTrack.requestFrame();
+    }
+}
+
+async function start() {
+    const size = await detectResolution();
+    canvas.width = size.width;
+    canvas.height = size.height;
+
+    const offscreen = canvas.transferControlToOffscreen();
+    const worker = new Worker("video-worker.js");
+
+    worker.onmessage = (event) => {
+        const message = event.data;
+        if (message.type === "frame") {
+            onRecordFrame(message.bitmap);
+            return;
+        }
+        if (message.type === "stats") {
+            clientStats = message;
+        } else if (message.type === "state") {
+            connection = message.state;
+        }
+        render();
+    };
+
+    // 录制要用的两样东西都在这个闭包里：画布和那个 tap 开关。
+    // captureStream(0) 是手动模式，见 onRecordFrame。
+    window.KvmVideo = {
+        startCapture() {
+            // 尺寸必须在开流之前定好：track 的分辨率取自调用这一刻的画布大小，
+            // 之后再变会让 WebM 里的分辨率和实际帧不一致。宁可用服务端报的
+            // 当前分辨率，也不要等第一帧到了才发现不对。
+            const current = (serverStats && serverStats.resolution) || [size.width, size.height];
+            recordCanvas.width = current[0];
+            recordCanvas.height = current[1];
+
+            const stream = recordCanvas.captureStream(0);
+            recordTrack = stream.getVideoTracks()[0];
+            worker.postMessage({type: "tap", on: true});
+            return stream;
+        },
+        stopCapture() {
+            worker.postMessage({type: "tap", on: false});
+            recordTrack = null;
+        },
+        // 有没有画面可录。不看画布（它在开录前根本没收到过帧），看帧是不是在流
+        streaming: () => !!clientStats && clientStats.drawn > 0
+    };
+
+    worker.postMessage(
+        {type: "init", canvas: offscreen, url: websocketUrl("/ws/video")},
+        [offscreen]
+    );
+
+    pollServerStats();
+    setInterval(pollServerStats, STATS_POLL_MS);
+}
+
+renderStatsToggle();
+
+start();

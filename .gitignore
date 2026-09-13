@@ -1,0 +1,18 @@
+/target
+
+# 自签名证书按本机地址生成，换机器要重签，不进版本库
+/certs
+
+# 调试时重定向的日志
+/server.log
+/server.err.log
+
+# 服务模式的日志：服务没有 stdout，只能写文件
+/rust-kvm.log
+
+# 设备与分辨率的选择，一机一份
+/config.json
+
+# probe-audio 的产物：录音和 session 0 那次探测的输出
+/audio-probe-*.wav
+/probe-session0.txt

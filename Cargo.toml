@@ -1,0 +1,35 @@
+[package]
+name = "rust-kvm"
+version = "0.1.0"
+edition = "2024"
+# src/bin/probe.rs 是诊断工具，cargo run 默认跑服务端
+default-run = "rust-kvm"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+bytes = "1.12.1"
+# realtime 必须显式开：cpal 的 default = []，不开的话采音线程跑在普通优先级上，
+# 会被采集卡那 30Mbps 的视频推流和浏览器抢占，错过 10ms 截止时间后 WASAPI 就丢样本
+# （表现为 DATA_DISCONTINUITY，人耳听到爆音）。详见 README。
+cpal = { version = "0.18.2", features = ["realtime"] }
+futures-util = "0.3.34"
+local-ip-address = "0.6.13"
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native"] }
+rcgen = "0.14.10"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serialport = "4.10.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tower-http = { version = "0.7.1", features = ["fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
+
+[target.'cfg(windows)'.dependencies]
+# 只为了 timeBeginPeriod：Windows 默认 15.6ms 的定时器精度会把串口轮询卡死在
+# 64Hz，键鼠往返直接多出十几毫秒。详见 serial_bridge.rs 里的说明。
+windows-sys = { version = "0.61.2", features = ["Win32_Media"] }
+# 注册成服务跑在 session 0。除了开机自启，这也是唯一能看到物理音频端点的办法：
+# 远程桌面会话里那些端点会被换成「远程音频」。详见 service.rs。
+windows-service = "0.8.0"
