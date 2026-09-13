@@ -17,7 +17,7 @@ use nokhwa::utils::{
 };
 use nokhwa::{Camera, query};
 use tokio::sync::{Notify, broadcast, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::VideoSettings;
 use crate::h264::{EncodedFrame, Encoder, EncoderConfig};
@@ -344,6 +344,13 @@ async fn supervise_encoder(hub: Arc<VideoHub>) {
         let worker = hub.clone();
         let outcome = tokio::task::spawn_blocking(move || encode_loop(&worker)).await;
         hub.encoding.store(false, Ordering::SeqCst);
+        // 编码器已经没了，那份 avc 字符串就不再代表「现在能发 h264」。留着的话
+        // 下一个连接会据此宣称 h264，然后一帧都收不到——比报错难查得多。
+        // 出错那两条路由 `record_fallback` 清，这里管正常退出。
+        hub.codec.send_if_modified(|state| {
+            let stale = state.avc_codec.take();
+            stale.is_some()
+        });
 
         match outcome {
             Ok(Ok(())) => info!("编码已停止"),
@@ -400,11 +407,17 @@ fn encode_loop(hub: &VideoHub) -> Result<()> {
 
         let jpeg = match frames.blocking_recv() {
             Ok(jpeg) => jpeg,
-            // 采集比我们快，我们落后了。JPEG 丢几帧无所谓（每帧独立），但**必须
-            // 补一个 IDR**：我们给下游发的是有依赖的码流，中间断了就得重新起头。
+            // 编码器喂不饱：采集比我们快，中间几帧没拿到。
+            //
+            // **这里不能补 IDR。** 丢的是*输入*，不是输出——编码器对拿到的帧依次
+            // 编码，P 帧参照的是它上一次编过的那帧，和跳过多少采集帧无关，码流
+            // 始终是完整的，下游照样解得出来，只是帧率低一些。
+            //
+            // 曾经在这儿补 IDR，结果是个正反馈：IDR 大 → 编得更慢 → 落后更多 →
+            // 补更多 IDR。实测把 30fps 压成了 2fps 的全 IDR 流。客户端丢包才需要
+            // IDR，那是 `pump_h264` 的事。
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!("编码落后 {skipped} 帧，补一个关键帧");
-                encoder.request_keyframe();
+                debug!("编码落后 {skipped} 帧（编码比采集慢）");
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -414,8 +427,21 @@ fn encode_loop(hub: &VideoHub) -> Result<()> {
         for packet in encoder.encode(&nv12)? {
             let _ = hub.encoded.send(packet);
         }
-        // codec 字符串要等第一个 SPS 才知道，所以每轮都问一下，直到问出来
-        if hub.codec.borrow().avc_codec.is_none()
+        // codec 字符串要等第一个 SPS 才知道，所以每轮都问一下，直到问出来。
+        //
+        // `wanted` 那个条件不是多余的：`set_config` 切到 mjpeg 时会把状态清空，但
+        // 这个循环要到下一轮才看见 `reconfigured`，中间这一次会把 avc 字符串又写
+        // 回去——写进一份已经不属于自己的状态里，而且之后没人再清。
+        //
+        // 读的结果先落成一个 bool，别把 `borrow()` 留在 `if` 的条件里：下面紧跟着
+        // 对同一个 watch 的 `send_modify`（写锁），读守卫要是还活着就是自己锁自己。
+        // 那到底会不会活着，取决于临时值作用域那套相当微妙的规则——这种地方不值得
+        // 去赌，写明白就没有可赌的了。
+        let needs_codec_string = {
+            let state = hub.codec.borrow();
+            state.wanted == VideoCodec::H264 && state.avc_codec.is_none()
+        };
+        if needs_codec_string
             && let Some(codec) = encoder.codec_string()
         {
             info!("编码器就绪，codec {codec}");

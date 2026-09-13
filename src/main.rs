@@ -238,7 +238,10 @@ async fn stream_video(socket: WebSocket, hub: Arc<VideoHub>) {
             let frames = hub.subscribe_h264();
             match await_codec(&mut codec_rx).await {
                 Ok(state) => {
-                    if send_codec_header(&mut sender, &state).await.is_err() {
+                    if send_codec_header(&mut sender, VideoCodec::H264, &state)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     if pump_h264(&mut sender, &mut reader, &hub, frames, &mut codec_rx).await.is_err() {
@@ -252,7 +255,10 @@ async fn stream_video(socket: WebSocket, hub: Arc<VideoHub>) {
             hub.codec_state()
         };
 
-        if send_codec_header(&mut sender, &state).await.is_err() {
+        if send_codec_header(&mut sender, VideoCodec::Mjpeg, &state)
+            .await
+            .is_err()
+        {
             break;
         }
         if pump_mjpeg(&mut sender, &mut reader, &hub, &mut codec_rx)
@@ -300,18 +306,23 @@ async fn await_codec(
     }
 }
 
-/// 头里只报**实际要发的**编码，不是配置里写的那个。
+/// 头里报的编码由**调用方**给，不在这里从 `state` 里猜。
+///
+/// 曾经在这儿按 `avc_codec.is_some()` 推断，结果是：编码任务和 `set_config` 抢
+/// 同一份状态，切回 mjpeg 后残留了一个 avc 字符串，于是头说 h264 而 `pump_mjpeg`
+/// 发的是 JPEG——客户端拿 JPEG 去喂 `VideoDecoder`，解码器一帧就死。
+///
+/// 教训是结构性的：头和帧必须出自**同一个决定**。分支已经知道自己要跑哪个 pump，
+/// 让它把答案带过来，就不存在两者不一致的可能。
 async fn send_codec_header(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    actual: VideoCodec,
     state: &video::CodecState,
 ) -> Result<(), ()> {
-    let actual = if state.avc_codec.is_some() {
-        VideoCodec::H264
-    } else {
-        VideoCodec::Mjpeg
-    };
     let mut header = serde_json::json!({"op": "codec", "codec": actual.as_str()});
-    if let Some(codec) = &state.avc_codec {
+    if actual == VideoCodec::H264
+        && let Some(codec) = &state.avc_codec
+    {
         header["avcCodec"] = serde_json::json!(codec);
     }
     if let Some(reason) = &state.fallback_reason {
