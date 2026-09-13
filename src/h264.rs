@@ -55,7 +55,11 @@ impl Encoder {
 }
 
 #[cfg(windows)]
-pub use windows_encoder::{Encoder, list_encoders};
+pub use windows_encoder::Encoder;
+// 只有 probe-h264 用，服务端那次编译里没人引，所以单独一行并标注
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub use windows_encoder::list_encoders;
 
 #[cfg(windows)]
 mod windows_encoder {
@@ -281,7 +285,11 @@ mod windows_encoder {
         }
     }
 
-    /// 列出所有能输出 H.264 的编码器 MFT 的名字。给探针用。
+    /// 列出所有能输出 H.264 的编码器 MFT 的名字。
+    ///
+    /// 只有 `probe-h264` 用（它靠 `#[path]` 把这个文件包进去，所以对服务端那次编译
+    /// 来说是死代码，但它并不是真的没人用）。
+    #[allow(dead_code)]
     pub fn list_encoders() -> Result<Vec<String>> {
         with_activates(|activates, count| {
             let mut names = Vec::new();
@@ -328,6 +336,8 @@ mod windows_encoder {
         outcome
     }
 
+    /// 同上，只有探针在用。
+    #[allow(dead_code)]
     fn friendly_name(activate: &IMFActivate) -> String {
         let mut buffer = windows::core::PWSTR::null();
         let mut len = 0u32;
@@ -428,12 +438,24 @@ mod windows_encoder {
         set_bool(codec, &CODECAPI_AVLowLatencyMode, true);
         // 2. B 帧要等后续帧才能编，是结构性延迟，对 KVM 纯亏
         set_u32(codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-        // 3. 质量优先的 VBR 在画面一变时会冲到几十 Mbps，正好炸掉 WAN 预算
+        // 3. 码率控制：**恒定质量 + 硬上限**，不是 CBR。
+        //
+        //    这一条起初写的是 CBR，理由是「质量优先的 VBR 一变就冲到几十 Mbps，
+        //    炸掉 WAN 预算」。实测发现 CBR 有个更糟的毛病：**它会把码率填满**。
+        //    对着完全静止的画面也照样跑 3.93 Mbps，而「不动的桌面几乎不要钱」正是
+        //    这个功能最大的收益（KVM 的画面大部分时间不动）。
+        //
+        //    而那个「冲到几十 Mbps」的顾虑，正解本来就是 `MaxBitRate` 这个上限，
+        //    不是 CBR。两者一起给：质量恒定、静止趋近于零、动起来有天花板。
         set_u32(
             codec,
             &CODECAPI_AVEncCommonRateControlMode,
-            eAVEncCommonRateControlMode_CBR.0 as u32,
+            eAVEncCommonRateControlMode_Quality.0 as u32,
         );
+        // 0-100。70 对文字足够清楚，再往上收益很小而码率涨得快。
+        set_u32(codec, &CODECAPI_AVEncCommonQuality, 70);
+        set_u32(codec, &CODECAPI_AVEncCommonMaxBitRate, config.bitrate_kbps * 1000);
+        // 有些编码器只看 Mean 不看 Max，两个都给上
         set_u32(codec, &CODECAPI_AVEncCommonMeanBitRate, config.bitrate_kbps * 1000);
         set_u32(codec, &CODECAPI_AVEncMPVGOPSize, config.fps * GOP_SECONDS);
     }

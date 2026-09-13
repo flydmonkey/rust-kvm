@@ -85,7 +85,7 @@ fn encoder_probe() -> Result<()> {
     })?;
     println!("编码器已就绪（NV12 进 / H.264 出，低延迟参数已设）");
 
-    let frame = synthetic_frame(WIDTH, HEIGHT);
+    let mut frame = synthetic_frame(WIDTH, HEIGHT, 0);
     println!("喂 {FRAMES} 帧 {WIDTH}x{HEIGHT} 合成画面…");
     println!();
 
@@ -101,6 +101,10 @@ fn encoder_probe() -> Result<()> {
         if i == FRAMES / 2 {
             encoder.request_keyframe();
         }
+        // 每帧都把图案挪一格：**整屏都在动**，是码率的最坏情况。码率控制用的是
+        // 「恒定质量 + 上限」，静止时几乎不要钱，所以要验的恰恰是上限管不管用
+        // ——不管用的话画面一动就冲上去，WAN 那头整件事就白做了。
+        shift_pattern(&mut frame, i);
         for packet in encoder.encode(&frame)? {
             bytes += packet.data.len();
             packets += 1;
@@ -150,15 +154,19 @@ fn encoder_probe() -> Result<()> {
 }
 
 /// 一张有内容的假图：纯色的话编码器几乎不产码率，量不出真实开销。
-fn synthetic_frame(width: u32, height: u32) -> nv12::Nv12Frame {
+fn synthetic_frame(width: u32, height: u32, phase: usize) -> nv12::Nv12Frame {
     let mut frame = nv12::Nv12Frame::new(width, height);
-    let y_size = (width * height) as usize;
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            frame.data[y * width as usize + x] = ((x * 7 + y * 13) % 256) as u8;
+    // 色度给中性灰，只是别让它是 0（那是绿色，看日志时容易误判）
+    frame.data[(width * height) as usize..].fill(128);
+    shift_pattern(&mut frame, phase);
+    frame
+}
+
+fn shift_pattern(frame: &mut nv12::Nv12Frame, phase: usize) {
+    let w = frame.width as usize;
+    for y in 0..frame.height as usize {
+        for x in 0..w {
+            frame.data[y * w + x] = ((x * 7 + y * 13 + phase * 11) % 256) as u8;
         }
     }
-    // 色度给中性灰，只是别让它是 0（那是绿色，看日志时容易误判）
-    frame.data[y_size..].fill(128);
-    frame
 }

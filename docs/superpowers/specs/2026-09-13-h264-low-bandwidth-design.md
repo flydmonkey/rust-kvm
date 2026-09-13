@@ -111,8 +111,17 @@ NV12 是：Y 平面取每第 3 个字节；UV 平面按 2×2 方块把 Cb、Cr �
    50–100ms。
 2. **B 帧 = 0**（`AVEncMPVDefaultBPictureCount`）。B 帧要等后续帧才能编，是结构性
    延迟，对 KVM 纯亏。
-3. 码率控制用 **CBR + 小 VBV**（`AVEncCommonRateControlMode` = CBR）。质量优先的 VBR
-   在画面一变时会瞬间冲到几十 Mbps，正好把 WAN 预算炸掉。
+3. 码率控制用 **恒定质量 + 硬上限**（`AVEncCommonRateControlMode` = `Quality`，
+   `AVEncCommonQuality` = 70，`AVEncCommonMaxBitRate` = 目标码率）。
+
+   这一条起初定的是 CBR，理由是「质量优先的 VBR 在画面一变时会冲到几十 Mbps，
+   炸掉 WAN 预算」。实测发现 CBR 有个更糟的毛病：**它会把码率填满**——对着完全
+   静止的画面照样跑 3.93 Mbps。而「不动的桌面几乎不要钱」正是这功能最大的收益，
+   KVM 的画面大部分时间是不动的。
+
+   至于「冲到几十 Mbps」那个顾虑，正解本来就是 `MaxBitRate` 这个上限，不是 CBR。
+   两者一起给之后实测：静止 **0.03 Mbps**（122 字节/帧）；逐帧全屏变化（合成高频
+   噪声，比任何真实桌面都难得多）稳态 **2.9 Mbps**，仍在 4 Mbps 上限之内。
 
 其余：Main profile；`AVEncMPVGOPSize` 设成 300（10 秒 @30fps），靠强制 IDR 处理新人
 进场而不是靠短 GOP——短 GOP 是拿常态码率换偶发事件，不值。

@@ -33,6 +33,11 @@ pub struct VideoSettings {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// `"mjpeg"` 或 `"h264"`。h264 省带宽（静止画面能到十分之一），代价是多一层
+    /// 编解码和宿主机一成 CPU；局域网用 mjpeg 延迟最低。
+    pub codec: String,
+    /// 只对 h264 有意义。固定码率，不做自适应（理由见低带宽模式的设计文档）。
+    pub bitrate_kbps: u32,
 }
 
 impl Default for VideoSettings {
@@ -42,6 +47,9 @@ impl Default for VideoSettings {
             width: 1920,
             height: 1080,
             fps: 30,
+            // 默认 mjpeg：日常是局域网，低带宽是出门时才开的
+            codec: "mjpeg".to_string(),
+            bitrate_kbps: 4000,
         }
     }
 }

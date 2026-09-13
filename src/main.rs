@@ -7,6 +7,8 @@ mod audio;
 mod certs;
 mod config;
 mod devices;
+mod h264;
+mod nv12;
 mod serial_bridge;
 #[cfg(windows)]
 mod service;
@@ -28,14 +30,15 @@ use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 use tower_http::services::ServeDir;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use audio::{AudioHub, AudioStats};
 use config::{Config, ConfigStore};
 use devices::Devices;
 use serial_bridge::{PortInfo, SerialHub};
-use video::{VideoHub, VideoStats};
+use video::{VideoCodec, VideoHub, VideoStats};
 
 /// 局域网访问走这个口，必须是 HTTPS：Keyboard Lock、剪贴板、Pointer Lock
 /// 都要求 secure context。
@@ -212,35 +215,182 @@ async fn ws_video(ws: WebSocketUpgrade, State(state): State<AppState>) -> Respon
     ws.on_upgrade(move |socket| stream_video(socket, state.hub))
 }
 
-/// 每帧一条 Binary 消息，内容就是采集卡直出的 JPEG。
+/// 先一条 Text 头说明编码，随后每条 Binary 是一帧。
+///
+/// 和 `/ws/audio` 先发格式头是同一个形状，客户端的处理结构照搬。改了配置就重发
+/// 一条头而不断开连接——断开会让画面闪一下，而这只是改了个设置。
 async fn stream_video(socket: WebSocket, hub: Arc<VideoHub>) {
-    let mut frames = hub.subscribe();
+    let mut codec_rx = hub.watch_codec();
     let (mut sender, mut receiver) = socket.split();
 
     // 收方向必须有人读：不读的话客户端发来的 close 和 ping 不会被处理，
     // 连接看起来就永远不会断，采集也跟着一直开着。
     let mut reader = tokio::spawn(async move { while let Some(Ok(_)) = receiver.next().await {} });
 
+    // 换编码要重新起头（h264 得从一个 IDR 开始），所以每一轮都重新订阅
+    loop {
+        let wanted = codec_rx.borrow_and_update().wanted;
+        let state = if wanted == VideoCodec::H264 {
+            // 配置说 h264 不等于现在就能发：客户端要 avc1.XXXXXX 才配得出解码器，
+            // 而那串东西得等编码器吐出第一个 SPS。这里等它，等不到就回落 MJPEG。
+            //
+            // 注意顺序：先订阅（让编码任务启动），再等。反了会永远等不到。
+            let frames = hub.subscribe_h264();
+            match await_codec(&mut codec_rx).await {
+                Ok(state) => {
+                    if send_codec_header(&mut sender, &state).await.is_err() {
+                        break;
+                    }
+                    if pump_h264(&mut sender, &mut reader, &hub, frames, &mut codec_rx).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(state) => state,
+            }
+        } else {
+            hub.codec_state()
+        };
+
+        if send_codec_header(&mut sender, &state).await.is_err() {
+            break;
+        }
+        if pump_mjpeg(&mut sender, &mut reader, &hub, &mut codec_rx)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    reader.abort();
+}
+
+/// 等编码器报出 codec 字符串。
+///
+/// `Ok` 表示可以发 h264；`Err` 带回当时的状态（里面有回落原因），调用方照它发
+/// mjpeg 头。超时也算回落——等不到就该给画面，而不是让人对着空白页。
+async fn await_codec(
+    codec_rx: &mut watch::Receiver<video::CodecState>,
+) -> Result<video::CodecState, video::CodecState> {
+    let deadline = tokio::time::Instant::now() + video::CODEC_TIMEOUT;
+    loop {
+        {
+            let state = codec_rx.borrow_and_update();
+            if state.wanted != VideoCodec::H264 || state.fallback_reason.is_some() {
+                return Err(state.clone());
+            }
+            if state.avc_codec.is_some() {
+                return Ok(state.clone());
+            }
+        }
+        if tokio::time::timeout_at(deadline, codec_rx.changed())
+            .await
+            .is_err()
+        {
+            let mut state = codec_rx.borrow().clone();
+            if state.fallback_reason.is_none() {
+                state.fallback_reason = Some(format!(
+                    "编码器没能在 {} 秒内就绪",
+                    video::CODEC_TIMEOUT.as_secs()
+                ));
+            }
+            return Err(state);
+        }
+    }
+}
+
+/// 头里只报**实际要发的**编码，不是配置里写的那个。
+async fn send_codec_header(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    state: &video::CodecState,
+) -> Result<(), ()> {
+    let actual = if state.avc_codec.is_some() {
+        VideoCodec::H264
+    } else {
+        VideoCodec::Mjpeg
+    };
+    let mut header = serde_json::json!({"op": "codec", "codec": actual.as_str()});
+    if let Some(codec) = &state.avc_codec {
+        header["avcCodec"] = serde_json::json!(codec);
+    }
+    if let Some(reason) = &state.fallback_reason {
+        header["fallbackReason"] = serde_json::json!(reason);
+    }
+    sender
+        .send(Message::Text(header.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// 配置变了就返回，让外层重发头。
+async fn pump_mjpeg(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reader: &mut tokio::task::JoinHandle<()>,
+    hub: &VideoHub,
+    codec_rx: &mut watch::Receiver<video::CodecState>,
+) -> Result<(), ()> {
+    let mut frames = hub.subscribe();
     loop {
         tokio::select! {
-            _ = &mut reader => break,
+            _ = &mut *reader => return Err(()),
+            _ = codec_rx.changed() => return Ok(()),
             frame = frames.recv() => match frame {
                 Ok(frame) => {
                     // send 会在客户端慢的时候等着，这期间 broadcast 那头会积压
                     // 并触发下面的 Lagged，正好实现「慢客户端丢帧」。
                     if sender.send(Message::Binary(frame)).await.is_err() {
-                        break;
+                        return Err(());
                     }
                 }
+                // MJPEG 每帧独立，丢最旧的是免费的降级
                 Err(RecvError::Lagged(skipped)) => {
                     debug!("客户端落后，跳过 {skipped} 帧");
                 }
-                Err(RecvError::Closed) => break,
+                Err(RecvError::Closed) => return Err(()),
             },
         }
     }
+}
 
-    reader.abort();
+async fn pump_h264(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reader: &mut tokio::task::JoinHandle<()>,
+    hub: &VideoHub,
+    mut frames: tokio::sync::broadcast::Receiver<h264::EncodedFrame>,
+    codec_rx: &mut watch::Receiver<video::CodecState>,
+) -> Result<(), ()> {
+    // 解码器必须从关键帧起头，否则什么都画不出来。订阅时已经请求过一个 IDR。
+    let mut waiting_for_keyframe = true;
+    loop {
+        tokio::select! {
+            _ = &mut *reader => return Err(()),
+            _ = codec_rx.changed() => return Ok(()),
+            frame = frames.recv() => match frame {
+                Ok(packet) => {
+                    if waiting_for_keyframe {
+                        if !packet.keyframe {
+                            continue;
+                        }
+                        waiting_for_keyframe = false;
+                    }
+                    if sender.send(Message::Binary(packet.data)).await.is_err() {
+                        return Err(());
+                    }
+                }
+                // **H.264 不能像 MJPEG 那样随便丢。** 丢一个 P 帧，后面整个 GOP
+                // 全烂，一直烂到下一个 IDR。所以请编码器补一个，并且在它到达之前
+                // 把帧全部丢掉——解码器在 IDR 上能重新同步，代价是一次可见的卡顿，
+                // 而不是持续花屏。
+                Err(RecvError::Lagged(skipped)) => {
+                    warn!("客户端落后 {skipped} 帧，等一个关键帧再继续");
+                    hub.request_keyframe();
+                    waiting_for_keyframe = true;
+                }
+                Err(RecvError::Closed) => return Err(()),
+            },
+        }
+    }
 }
 
 async fn video_stats(State(state): State<AppState>) -> Json<VideoStats> {
