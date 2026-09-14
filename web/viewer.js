@@ -63,7 +63,11 @@ function render() {
         const h264 = clientStats.codec === "h264";
         lines.push(
             `编码      ${h264 ? "H.264" : "MJPEG"}${h264 ? `  解码队列 ${clientStats.decodeQueue}` : ""}`,
-            `本机收到  ${clientStats.received} 帧  ${formatMbps(clientStats.mbps)} Mbps`,
+            // 静止时 MJPEG 那条路一帧都不发，收帧数会停在 0。不说清楚的话，这和
+            // 「流卡死了」在页面上完全一样——而那正是最容易让人不敢信这个工具的状态。
+            clientStats.idleSkipped === null || clientStats.idleSkipped === undefined
+                ? `本机收到  ${clientStats.received} 帧  ${formatMbps(clientStats.mbps)} Mbps`
+                : `本机收到  画面静止（已省 ${clientStats.idleSkipped} 帧重复画面）`,
             // H.264 的解码在解码器里异步做，主线程掐不到表，所以那一栏不报
             h264
                 ? `本机绘制  ${clientStats.drawn} 帧`

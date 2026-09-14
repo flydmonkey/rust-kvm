@@ -17,6 +17,7 @@ mod video;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Json;
@@ -335,6 +336,13 @@ async fn send_codec_header(
 }
 
 /// 配置变了就返回，让外层重发头。
+/// 画面静止时隔这么久发一条「还活着」。
+///
+/// 两个用处。一是告诉页面「没有新帧是因为画面没变，不是卡住了」——这两种状态在
+/// 线上完全一样，而分不清会让人以为坏了。二是 NAT/代理会掐掉长时间没有流量的连接，
+/// MJPEG 本来是局域网用的、这个风险不高，但代价只有十几个字节。
+const IDLE_NOTICE: Duration = Duration::from_secs(2);
+
 async fn pump_mjpeg(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     reader: &mut tokio::task::JoinHandle<()>,
@@ -342,12 +350,41 @@ async fn pump_mjpeg(
     codec_rx: &mut watch::Receiver<video::CodecState>,
 ) -> Result<(), ()> {
     let mut frames = hub.subscribe();
+    // 上一帧发出去的字节。**重复的帧不再发一遍**：采集卡对着静止画面吐的是逐字节
+    // 相同的 JPEG（实测 6 秒 181 帧只有一个哈希），而客户端画布上已经是那一帧了，
+    // 所以不发是无损的——省掉的就是整整 15.8 Mbps。
+    //
+    // 为什么按连接存、而不是在 hub 里存一份共用的：新观看者的 `last` 是空的，第一帧
+    // 自然会发给他，不需要额外的「补一帧」逻辑。放在 hub 里反而要专门处理静止时新人
+    // 进场（不处理就是黑屏），而那正是 H.264 那条路上「强制 IDR」解决的同一个问题。
+    // 63 KB 的比对按连接各做一次也无所谓，一个观看者一秒不到 2 MB。
+    let mut last: Option<bytes::Bytes> = None;
+    let mut skipped_duplicates = 0u64;
+    // **必须是绝对时刻，不能在 select 里现造 `sleep(IDLE_NOTICE)`。** 后者每轮循环
+    // 都重新计时，而静止时重复帧仍在 33ms 一个地到——计时器永远归零，这条通知一次
+    // 也发不出去，整个「看得出还活着」就白做了。
+    let mut next_notice = tokio::time::Instant::now() + IDLE_NOTICE;
     loop {
         tokio::select! {
             _ = &mut *reader => return Err(()),
             _ = codec_rx.changed() => return Ok(()),
+            // 静止时这条是唯一的出口，所以它也兼任「连接还在」的心跳
+            _ = tokio::time::sleep_until(next_notice) => {
+                let notice = serde_json::json!({"op": "idle", "skipped": skipped_duplicates});
+                if sender.send(Message::Text(notice.to_string().into())).await.is_err() {
+                    return Err(());
+                }
+                next_notice = tokio::time::Instant::now() + IDLE_NOTICE;
+            }
             frame = frames.recv() => match frame {
                 Ok(frame) => {
+                    // 重复帧不重置上面那个计时器：静止多久就该照着节奏报多久
+                    if last.as_ref() == Some(&frame) {
+                        skipped_duplicates += 1;
+                        continue;
+                    }
+                    last = Some(frame.clone());
+                    next_notice = tokio::time::Instant::now() + IDLE_NOTICE;
                     // send 会在客户端慢的时候等着，这期间 broadcast 那头会积压
                     // 并触发下面的 Lagged，正好实现「慢客户端丢帧」。
                     if sender.send(Message::Binary(frame)).await.is_err() {

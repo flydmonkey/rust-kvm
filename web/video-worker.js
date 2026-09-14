@@ -29,6 +29,8 @@ let decoder = null;
 let decoderCodec = null;
 // H.264 得从一个关键帧起头，之前的帧喂进去只会报错
 let seenKeyFrame = false;
+// 服务端说画面静止时，累计跳过了多少重复帧；收到新帧就清空
+let idleSkipped = null;
 
 let window_ = newWindow();
 
@@ -71,13 +73,20 @@ function connect() {
     socket.onerror = () => {};
 
     socket.onmessage = (event) => {
-        // Text 是编码头，Binary 是帧。服务端在连上时发一条头，改了配置再发一条
-        // ——所以任何时候收到 Text 都当作「重新配置解码器」。
+        // Text 有两种：编码头和「画面静止」通知。Binary 是帧。
         if (typeof event.data === "string") {
-            applyHeader(JSON.parse(event.data));
+            const message = JSON.parse(event.data);
+            if (message.op === "idle") {
+                // MJPEG 模式下重复帧不发，所以画面不动时一帧都不会来。没有这条
+                // 通知的话，收帧计数停住和「流卡死了」在页面上长得一模一样。
+                idleSkipped = message.skipped;
+                return;
+            }
+            applyHeader(message);
             return;
         }
 
+        idleSkipped = null;
         window_.received += 1;
         window_.bytes += event.data.byteLength;
 
@@ -293,7 +302,8 @@ function report() {
         codec: codec,
         // 持续上涨才说明解码跟不上。H.264 那条路不丢帧，所以这是唯一能看出
         // 「客户端撑不住了」的读数。
-        decodeQueue: decoder ? decoder.decodeQueueSize : 0
+        decodeQueue: decoder ? decoder.decodeQueueSize : 0,
+        idleSkipped: idleSkipped
     });
 }
 
