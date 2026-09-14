@@ -4,7 +4,7 @@
 //! 设备是独占的，所以采集按需启停：有人看才开，没人看了再多采一会儿就关掉，
 //! 好让别的程序（或者本地的 chrome-kvm）能用这张卡。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,7 +96,11 @@ pub struct VideoStats {
     /// 自己按帧间隔算的，不能用 nokhwa 报的 camera_format().frame_rate()——
     /// 那个字段在 MS2109 上报的是 1fps，和实测的 29.5fps 完全不符。
     pub fps: f32,
+    /// 采集卡吐出来的码率。**这不是上线的流量**：静止画面下 MJPEG 的重复帧不会
+    /// 转发、H.264 每帧只有几十字节，实际发出去的看 `sent_mbps`。
     pub mbps: f32,
+    /// 真正写进 WebSocket 的码率，所有观看者之和。
+    pub sent_mbps: f32,
     pub frames: u64,
     pub last_frame_bytes: usize,
     pub resolution: Option<(u32, u32)>,
@@ -112,6 +116,7 @@ struct StatsInner {
     window: Option<Window>,
     fps: f32,
     mbps: f32,
+    sent_mbps: f32,
     error: Option<String>,
 }
 
@@ -119,6 +124,8 @@ struct Window {
     started: Instant,
     frames: u32,
     bytes: u64,
+    /// 开窗时 `VideoHub::sent` 的读数，用来算这一秒发出去了多少
+    sent_at_start: u64,
 }
 
 pub struct VideoHub {
@@ -129,6 +136,9 @@ pub struct VideoHub {
     wake: Notify,
     capturing: AtomicBool,
     stats: Mutex<StatsInner>,
+    /// 累计写进 WebSocket 的字节。由各条连接的推流循环累加——去重和 H.264 都在
+    /// 采集之后，只有这里数得到真实出口流量。
+    sent: AtomicU64,
 
     /// 编码后的帧。没有 h264 订阅者时编码任务根本不启动。
     encoded: broadcast::Sender<EncodedFrame>,
@@ -151,6 +161,7 @@ impl VideoHub {
             wake: Notify::new(),
             capturing: AtomicBool::new(false),
             stats: Mutex::new(StatsInner::default()),
+            sent: AtomicU64::new(0),
             encoded,
             encode_wake: Notify::new(),
             encoding: AtomicBool::new(false),
@@ -230,6 +241,7 @@ impl VideoHub {
             viewers: self.frames.receiver_count(),
             fps: inner.fps,
             mbps: inner.mbps,
+            sent_mbps: inner.sent_mbps,
             frames: inner.frames,
             last_frame_bytes: inner.last_frame_bytes,
             resolution: inner.resolution,
@@ -244,8 +256,10 @@ impl VideoHub {
             inner.error = None;
             inner.resolution = resolution;
         } else {
+            // 采集停了，窗口不会再翻页，码率得手动清零，否则会一直停在最后一个读数
             inner.fps = 0.0;
             inner.mbps = 0.0;
+            inner.sent_mbps = 0.0;
         }
     }
 
@@ -265,6 +279,7 @@ impl VideoHub {
         inner.capturing = false;
         inner.fps = 0.0;
         inner.mbps = 0.0;
+        inner.sent_mbps = 0.0;
         inner.error = Some(message);
     }
 
@@ -273,10 +288,14 @@ impl VideoHub {
         inner.frames += 1;
         inner.last_frame_bytes = len;
 
+        // 出口字节由各条连接自己累加，这里只在开窗和收窗时各读一次差值。借采集
+        // 的节奏来分窗：采集一直在跑，哪怕一帧都没往外发，窗口也会照常翻页。
+        let sent_now = self.sent.load(Ordering::Relaxed);
         let window = inner.window.get_or_insert_with(|| Window {
             started: Instant::now(),
             frames: 0,
             bytes: 0,
+            sent_at_start: sent_now,
         });
         window.frames += 1;
         window.bytes += len as u64;
@@ -285,13 +304,20 @@ impl VideoHub {
         let elapsed = window.started.elapsed();
         let frames = window.frames;
         let bytes = window.bytes;
+        let sent = sent_now.saturating_sub(window.sent_at_start);
 
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f32();
             inner.fps = frames as f32 / secs;
             inner.mbps = bytes as f32 * 8.0 / secs / 1_000_000.0;
+            inner.sent_mbps = sent as f32 * 8.0 / secs / 1_000_000.0;
             inner.window = None;
         }
+    }
+
+    /// 推流循环每发出一块数据就报一次。
+    pub fn record_sent(&self, len: usize) {
+        self.sent.fetch_add(len as u64, Ordering::Relaxed);
     }
 }
 

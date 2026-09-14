@@ -385,6 +385,7 @@ async fn pump_mjpeg(
                     }
                     last = Some(frame.clone());
                     next_notice = tokio::time::Instant::now() + IDLE_NOTICE;
+                    hub.record_sent(frame.len());
                     // send 会在客户端慢的时候等着，这期间 broadcast 那头会积压
                     // 并触发下面的 Lagged，正好实现「慢客户端丢帧」。
                     if sender.send(Message::Binary(frame)).await.is_err() {
@@ -422,6 +423,7 @@ async fn pump_h264(
                         }
                         waiting_for_keyframe = false;
                     }
+                    hub.record_sent(packet.data.len());
                     if sender.send(Message::Binary(packet.data)).await.is_err() {
                         return Err(());
                     }

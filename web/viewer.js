@@ -50,7 +50,11 @@ function render() {
             ? `${serverStats.resolution[0]}x${serverStats.resolution[1]}`
             : "未知";
         lines.push(
-            `服务端    ${serverStats.fps.toFixed(1)} fps  ${serverStats.mbps.toFixed(1)} Mbps  ${resolution}`,
+            `服务端    ${serverStats.fps.toFixed(1)} fps  ${resolution}`,
+            // 采集和发送必须分开写。采集卡不管画面动不动都吐 44 Mbps，而重复帧
+            // 不发、H.264 静止时每帧几十字节，真正上线的是后一个数——把两者混成
+            // 一个「服务端码率」，就会得出「静止画面也要 44 Mbps」的错误结论。
+            `码率      采集 ${serverStats.mbps.toFixed(1)}  发送 ${formatMbps(serverStats.sentMbps)} Mbps`,
             `观看者    ${serverStats.viewers}${serverStats.capturing ? "  采集中" : "  未采集"}`
         );
         if (serverStats.error) {
