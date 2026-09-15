@@ -39,7 +39,40 @@ data class SerialSettings(
     val mouseMode: String = "absolute",
 )
 
+@Serializable
+data class KvmDevices(
+    val video: DeviceList<VideoDevice> = DeviceList(),
+    val audio: DeviceList<AudioDevice> = DeviceList(),
+    val serial: DeviceList<SerialDevice> = DeviceList(),
+)
+
+@Serializable
+data class DeviceList<T>(
+    val items: List<T> = emptyList(),
+    val error: String? = null,
+)
+
+@Serializable
+data class VideoDevice(
+    val index: String = "",
+    val name: String = "",
+)
+
+@Serializable
+data class AudioDevice(
+    val name: String = "",
+    val sampleRate: Int? = null,
+    val channels: Int? = null,
+)
+
+@Serializable
+data class SerialDevice(
+    val name: String = "",
+    val description: String? = null,
+)
+
 private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
 fun parseConfig(text: String): KvmConfig = json.decodeFromString(text)
 fun encodeConfig(config: KvmConfig): String = json.encodeToString(config)
+fun parseDevices(text: String): KvmDevices = json.decodeFromString(text)

@@ -26,4 +26,23 @@ class ConfigModelsTest {
         val again = parseConfig(encodeConfig(original))
         assertEquals(original, again)
     }
+
+    @Test
+    fun parsesDevicesAndIgnoresUnknownFields() {
+        val devices = parseDevices(
+            """
+            {
+              "video":{"items":[{"index":"0","name":"USB Video","extra":true}],"error":null},
+              "audio":{"items":[{"name":"USB Audio","sampleRate":96000,"channels":1}],"error":null},
+              "serial":{"items":[{"name":"COM3","description":"USB-SERIAL CH340"}],"error":"占用中"},
+              "futureField":"ignored"
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals("USB Video", devices.video.items.single().name)
+        assertEquals(96000, devices.audio.items.single().sampleRate)
+        assertEquals("COM3", devices.serial.items.single().name)
+        assertEquals("占用中", devices.serial.error)
+    }
 }

@@ -7,7 +7,6 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavType
@@ -19,6 +18,7 @@ import com.rustkvm.app.data.RecentServersStore
 import com.rustkvm.app.trust.SharedPrefsCertTrustStore
 import com.rustkvm.app.ui.ConnectScreen
 import com.rustkvm.app.ui.ControlScreen
+import com.rustkvm.app.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,17 +46,31 @@ class MainActivity : ComponentActivity() {
                                 navArgument("baseUrl") { type = NavType.StringType },
                             ),
                         ) { entry ->
+                            val baseUrl = Uri.decode(
+                                requireNotNull(entry.arguments?.getString("baseUrl")),
+                            )
                             ControlScreen(
+                                baseUrl = baseUrl,
+                                trustStore = trustStore,
+                                onDisconnect = { navController.popBackStack() },
+                                onOpenSettings = {
+                                    navController.navigate("settings/${Uri.encode(baseUrl)}")
+                                },
+                            )
+                        }
+                        composable(
+                            route = "settings/{baseUrl}",
+                            arguments = listOf(
+                                navArgument("baseUrl") { type = NavType.StringType },
+                            ),
+                        ) { entry ->
+                            SettingsScreen(
                                 baseUrl = Uri.decode(
                                     requireNotNull(entry.arguments?.getString("baseUrl")),
                                 ),
                                 trustStore = trustStore,
-                                onDisconnect = { navController.popBackStack() },
-                                onOpenSettings = { navController.navigate("settings") },
+                                onBack = { navController.popBackStack() },
                             )
-                        }
-                        composable("settings") {
-                            Text("设置页待实现")
                         }
                     }
                 }
