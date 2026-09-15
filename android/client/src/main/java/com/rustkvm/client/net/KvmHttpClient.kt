@@ -27,7 +27,7 @@ class KvmHttpClient(
     private val trustStore: CertTrustStore,
     private val onCertDecision: suspend (CertDecision) -> Boolean,
 ) {
-    internal val baseUrl: HttpUrl = normalizeServerUrl(baseUrl).toString().toHttpUrl()
+    internal val baseUrl: HttpUrl = normalizeServerUrl(baseUrl).toString().toHttpUrl().also(::requireHttpsScheme)
     internal val hostPort: String = "${this.baseUrl.host}:${this.baseUrl.port}"
     private val trustDecisionMutex = Mutex()
 
@@ -133,5 +133,11 @@ class KvmHttpClient(
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        internal fun requireHttpsScheme(url: HttpUrl) {
+            if (!url.isHttps) {
+                throw IllegalArgumentException("仅支持 https")
+            }
+        }
     }
 }
