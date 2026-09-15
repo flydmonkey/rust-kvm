@@ -13,3 +13,10 @@
 - 单元测试覆盖三/四字节起始码、前导垃圾、尾随空起始码、相邻起始码、NAL 类型掩码及无完整 NAL。
 - `.\gradlew.bat :client:testDebugUnitTest :app:assembleDebug` — BUILD SUCCESSFUL。
 - MediaCodec 真机/仪器测试：SKIPPED（当前没有可用 Android 设备）；MediaCodec 保持薄封装，纯字节扫描逻辑由 JVM 单测覆盖。
+
+## 审查修复
+
+- `VideoPipeline` 现在只在 `stateLock` 内快照或替换解码器引用，MJPEG 绘制、H.264 排队及旧解码器关闭均在锁外执行。
+- H.264 输入缓冲改为 10ms 有界等待；缓冲不可用时丢弃当前 access unit，避免 codec 切换死锁。
+- `H264Decoder` 捕获并记录 MediaCodec 创建/排队异常，失败后安全重置 codec，避免单帧故障取消整个协程作用域。
+- IDR 缺少 SPS/PPS 时仅告警一次，并新增 Robolectric 回归测试；同时移除了未使用的 `avcCodec` 构造参数。

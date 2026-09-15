@@ -27,19 +27,27 @@ class VideoPipeline(
                 launch {
                     session.videoText.collect { text ->
                         when (val message = parseVideoText(text)) {
-                            is VideoText.Codec -> stateLock.withLock {
+                            is VideoText.Codec -> {
                                 val next = CodecSelection(
                                     codec = message.codec.lowercase(),
                                     avcCodec = message.avcCodec,
                                 )
-                                if (next != selection) {
-                                    h264Decoder?.close()
-                                    h264Decoder = null
-                                    selection = next
-                                    if (next.codec == H264_CODEC && next.avcCodec != null) {
-                                        h264Decoder = H264Decoder(surface, next.avcCodec)
+                                var previousDecoder: H264Decoder? = null
+                                stateLock.withLock {
+                                    if (next != selection) {
+                                        previousDecoder = h264Decoder
+                                        h264Decoder = if (
+                                            next.codec == H264_CODEC &&
+                                            next.avcCodec != null
+                                        ) {
+                                            H264Decoder(surface)
+                                        } else {
+                                            null
+                                        }
+                                        selection = next
                                     }
                                 }
+                                previousDecoder?.close()
                             }
 
                             is VideoText.Idle, VideoText.Unknown -> Unit
@@ -47,18 +55,20 @@ class VideoPipeline(
                     }
                 }
                 session.videoBinary.collect { bytes ->
-                    stateLock.withLock {
-                        when (selection?.codec) {
-                            MJPEG_CODEC -> render(bytes)
-                            H264_CODEC -> h264Decoder?.queue(bytes)
-                        }
+                    val (codec, decoder) = stateLock.withLock {
+                        selection?.codec to h264Decoder
+                    }
+                    when (codec) {
+                        MJPEG_CODEC -> render(bytes)
+                        H264_CODEC -> decoder?.queue(bytes)
                     }
                 }
             }
         } finally {
-            stateLock.withLock {
-                h264Decoder?.close()
+            val decoder = stateLock.withLock {
+                h264Decoder.also { h264Decoder = null }
             }
+            decoder?.close()
         }
     }
 

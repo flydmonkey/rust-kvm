@@ -2,31 +2,57 @@ package com.rustkvm.client.video
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.util.Log
 import android.view.Surface
 import java.io.Closeable
 import java.nio.ByteBuffer
 
 class H264Decoder(
     private val surface: Surface,
-    val avcCodec: String,
 ) : Closeable {
     private var codec: MediaCodec? = null
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
+    private var closed = false
+    private var missingParameterSetsWarned = false
 
+    @Synchronized
     fun queue(accessUnit: ByteArray) {
+        if (closed) return
         val nals = AnnexBNalScanner.scan(accessUnit)
         rememberParameterSets(accessUnit, nals)
 
+        try {
+            queueToCodec(accessUnit, nals)
+        } catch (error: Exception) {
+            Log.w(TAG, "Dropping H.264 access unit after MediaCodec failure", error)
+            resetCodec()
+        }
+    }
+
+    private fun queueToCodec(
+        accessUnit: ByteArray,
+        nals: List<AnnexBNalUnit>,
+    ) {
         var currentCodec = codec
         if (currentCodec == null) {
             if (nals.none { it.type == NAL_IDR }) return
-            currentCodec = createCodec(sps ?: return, pps ?: return)
+            val currentSps = sps
+            val currentPps = pps
+            if (currentSps == null || currentPps == null) {
+                if (!missingParameterSetsWarned) {
+                    missingParameterSetsWarned = true
+                    Log.w(TAG, "Ignoring IDR until both SPS/PPS have arrived")
+                }
+                return
+            }
+            currentCodec = createCodec(currentSps, currentPps)
             codec = currentCodec
         }
 
         drainOutput(currentCodec)
-        val inputIndex = currentCodec.dequeueInputBuffer(WAIT_FOREVER)
+        val inputIndex = currentCodec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        if (inputIndex < 0) return
         val input = requireNotNull(currentCodec.getInputBuffer(inputIndex)) {
             "MediaCodec returned no input buffer"
         }
@@ -50,11 +76,18 @@ class H264Decoder(
         drainOutput(currentCodec)
     }
 
+    @Synchronized
     override fun close() {
+        if (closed) return
+        closed = true
+        resetCodec()
+    }
+
+    private fun resetCodec() {
         val currentCodec = codec ?: return
         codec = null
         runCatching { currentCodec.stop() }
-        currentCodec.release()
+        runCatching { currentCodec.release() }
     }
 
     private fun rememberParameterSets(
@@ -106,8 +139,9 @@ class H264Decoder(
         const val NAL_PPS = 8
         const val DEFAULT_WIDTH = 1920
         const val DEFAULT_HEIGHT = 1080
-        const val WAIT_FOREVER = -1L
+        const val INPUT_TIMEOUT_US = 10_000L
         const val NO_WAIT = 0L
         const val NANOS_PER_MICROSECOND = 1_000L
+        const val TAG = "H264Decoder"
     }
 }
