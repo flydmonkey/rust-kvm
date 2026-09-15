@@ -2,6 +2,8 @@
 
 2026-09-15
 
+一期实施计划见 [`docs/superpowers/plans/2026-09-15-android-client.md`](../plans/2026-09-15-android-client.md)。
+
 ## 目标
 
 在 Android 上落地 rust-kvm 的能力，分两期交付，但用**同一份设计**约束协议与模块边界：
