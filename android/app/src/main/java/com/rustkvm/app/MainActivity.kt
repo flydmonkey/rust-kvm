@@ -4,13 +4,10 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Text
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.remember
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -20,6 +17,7 @@ import androidx.navigation.navArgument
 import com.rustkvm.app.data.RecentServersStore
 import com.rustkvm.app.trust.SharedPrefsCertTrustStore
 import com.rustkvm.app.ui.ConnectScreen
+import com.rustkvm.app.ui.ControlScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,13 +44,13 @@ class MainActivity : ComponentActivity() {
                             arguments = listOf(
                                 navArgument("baseUrl") { type = NavType.StringType },
                             ),
-                        ) {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Text("控制页占位")
-                            }
+                        ) { entry ->
+                            ControlScreen(
+                                baseUrl = Uri.decode(
+                                    requireNotNull(entry.arguments?.getString("baseUrl")),
+                                ),
+                                trustStore = trustStore,
+                            )
                         }
                     }
                 }
