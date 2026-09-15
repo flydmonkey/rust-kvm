@@ -48,6 +48,19 @@ class SerialControlTest {
     }
 
     @Test
+    fun setAbsoluteMouseUpdatesCh9329Mode() = runBlocking {
+        val session = FakeSerialConnection()
+        val control = SerialControl(
+            sessionFactory = { session },
+            settings = SerialSettings(mouseMode = "absolute"),
+        )
+        session.text.emit("""{"op":"status","open":true}""")
+        control.open()
+        control.setAbsoluteMouse(false)
+        assertEquals(false, control.absoluteMouse)
+    }
+
+    @Test
     fun absoluteMouseWritesCh9329FrameToSerialBinary() = runBlocking {
         val session = FakeSerialConnection()
         val control = SerialControl(

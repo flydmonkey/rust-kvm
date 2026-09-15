@@ -73,6 +73,8 @@ fun ControlScreen(
     var serialControl by remember(baseUrl) { mutableStateOf<SerialControl<KvmSession>?>(null) }
     var serialBusy by remember(baseUrl) { mutableStateOf<ControlBusy?>(null) }
     var requestedTakeover by remember(baseUrl) { mutableStateOf(false) }
+    var userDisconnected by remember(baseUrl) { mutableStateOf(false) }
+    var absoluteMouse by remember(baseUrl) { mutableStateOf<Boolean?>(null) }
     var connectionGeneration by remember(baseUrl) { mutableStateOf(0) }
     val pcmPlayer = remember(baseUrl) { PcmPlayer() }
     val focusRequester = remember(baseUrl) { FocusRequester() }
@@ -94,13 +96,16 @@ fun ControlScreen(
         var takeover = requestedTakeover
         requestedTakeover = false
         var firstAttempt = true
-        while (true) {
+        while (!userDisconnected) {
             var control: SerialControl<KvmSession>? = null
             try {
                 state = if (firstAttempt) ControlState.Connecting else ControlState.Reconnecting
                 audioError = null
                 val loadedConfig = client.getConfig()
                 config = loadedConfig
+                if (absoluteMouse == null) {
+                    absoluteMouse = loadedConfig.serial.mouseMode != "relative"
+                }
                 val activeControl = SerialControl(
                     sessionFactory = client::newSession,
                     settings = loadedConfig.serial,
@@ -108,6 +113,7 @@ fun ControlScreen(
                 )
                 control = activeControl
                 serialControl = activeControl
+                absoluteMouse?.let { activeControl.setAbsoluteMouse(it) }
                 val session = activeControl.open(takeover = takeover)
                 takeover = false
                 reconnectPolicy.reset()
@@ -155,14 +161,19 @@ fun ControlScreen(
                 state = ControlState.Failed("串口被其他客户端占用")
                 return@LaunchedEffect
             } catch (error: Exception) {
+                if (userDisconnected) break
                 takeover = false
                 state = ControlState.Reconnecting
                 delay(reconnectPolicy.nextDelayMs())
+                if (userDisconnected) break
                 firstAttempt = false
             } finally {
                 if (serialControl === control) serialControl = null
                 control?.close()
             }
+        }
+        if (userDisconnected) {
+            onDisconnect()
         }
     }
 
@@ -173,6 +184,7 @@ fun ControlScreen(
         contentAlignment = Alignment.Center,
     ) {
         val currentConfig = config
+        val useAbsoluteMouse = absoluteMouse ?: (currentConfig?.serial?.mouseMode != "relative")
         VideoSurface(
             modifier = Modifier
                 .fillMaxSize()
@@ -195,7 +207,7 @@ fun ControlScreen(
                         Modifier.ch9329TouchInput(
                             videoWidth = currentConfig.video.width,
                             videoHeight = currentConfig.video.height,
-                            absoluteMouse = currentConfig.serial.mouseMode != "relative",
+                            absoluteMouse = useAbsoluteMouse,
                             onAbsolute = { x, y, buttons ->
                                 runCatching {
                                     serialControl?.mouseMoveAbsolute(x, y, buttons)
@@ -260,19 +272,17 @@ fun ControlScreen(
             }) {
                 Text("粘贴")
             }
-            TextButton(onClick = onOpenSettings) {
-                Text(
-                    if (currentConfig?.serial?.mouseMode == "relative") {
-                        "鼠标：相对"
-                    } else {
-                        "鼠标：绝对"
-                    },
-                )
+            TextButton(onClick = {
+                val next = !useAbsoluteMouse
+                absoluteMouse = next
+                runCatching { serialControl?.setAbsoluteMouse(next) }
+            }) {
+                Text(if (useAbsoluteMouse) "鼠标：绝对" else "鼠标：相对")
             }
             TextButton(onClick = {
+                userDisconnected = true
                 runCatching { serialControl?.releaseAllKeys() }
                 serialControl?.close()
-                onDisconnect()
             }) {
                 Text("断开")
             }

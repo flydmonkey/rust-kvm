@@ -28,6 +28,7 @@ class SerialControl<S : SerialConnection>(
     private var connection: S? = null
     private var ch9329: Ch9329? = null
     private var pasteTyper: PasteTyper? = null
+    private var absoluteMouseOverride: Boolean? = null
 
     suspend fun open(takeover: Boolean = false): S {
         check(connection == null) { "Serial control is already open" }
@@ -55,7 +56,7 @@ class SerialControl<S : SerialConnection>(
 
             connection = candidate
             val hid = Ch9329(
-                absoluteMouse = settings.mouseMode != "relative",
+                absoluteMouse = absoluteMouseOverride ?: (settings.mouseMode != "relative"),
                 write = { frame ->
                     if (!candidate.sendSerialBinary(frame)) {
                         throw IOException("串口输入发送失败")
@@ -87,6 +88,16 @@ class SerialControl<S : SerialConnection>(
 
     fun mouseMoveRelative(dx: Int, dy: Int, buttons: Int) =
         requireHid().mouseMoveRelative(dx, dy, buttons)
+
+    fun setAbsoluteMouse(absolute: Boolean) {
+        absoluteMouseOverride = absolute
+        ch9329?.absoluteMouse = absolute
+    }
+
+    val absoluteMouse: Boolean
+        get() = ch9329?.absoluteMouse
+            ?: absoluteMouseOverride
+            ?: (settings.mouseMode != "relative")
 
     override fun close() {
         pasteTyper = null

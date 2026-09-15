@@ -13,3 +13,10 @@
 - 新增 `PasteTyperTest`：验证 ASCII 按包顺序、长度、修饰位、20ms 间隔及不支持字符跳过。
 - 新增 `ReconnectPolicyTest`：验证指数退避、10 秒封顶和 reset。
 - `.\gradlew.bat :client:testDebugUnitTest :app:assembleDebug`：通过。
+
+## P2 修复
+
+- 新增 `userDisconnected` 标志；工具栏「断开」退出重连 `while` 循环，循环结束后调用 `onDisconnect()`。
+- 工具栏「鼠标：绝对/相对」本地切换，经 `SerialControl.setAbsoluteMouse` 同步至 `Ch9329`。
+- 新增 `SerialControlTest.setAbsoluteMouseUpdatesCh9329Mode`。
+- `.\gradlew.bat :app:assembleDebug :client:testDebugUnitTest`：通过。

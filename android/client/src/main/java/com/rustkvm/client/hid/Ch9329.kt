@@ -8,9 +8,10 @@ import kotlin.math.floor
  * Writes are immediate; ACK queueing can be added without changing the public input API.
  */
 class Ch9329(
-    val absoluteMouse: Boolean,
+    absoluteMouse: Boolean,
     private val write: (ByteArray) -> Unit,
 ) {
+    var absoluteMouse: Boolean = absoluteMouse
     private val pressedKeys = mutableListOf<Int>()
     private val pressedModifiers = mutableSetOf<String>()
 
