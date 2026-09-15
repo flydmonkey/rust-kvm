@@ -755,7 +755,7 @@ git commit -am "android: 串口控制权与触摸键鼠映射"
 **Interfaces:**
 - Consumes: `Ch9329`、剪贴板
 - Produces:
-  - `PasteTyper`：按字符/按键序列发送，默认间隔对齐 web（若 web 为 ~30–50ms/键，常量写死并注释来源文件行）
+  - `PasteTyper`：调用与 `web/ch9329.js` `typeText` 等价逻辑；包间隔 **20ms**（见 `web/input.js` 粘贴注释：关 ACK 时每字符按下+抬起约 40ms）。常量 `PACKET_GAP_MS = 20` 写死并注释来源
   - `ReconnectPolicy`：指数退避，初始 500ms，上限 10_000ms；重连成功后**不**自动 takeover；UI 角标「重连中」
   - 工具条：静音、松开所有键、CAD、粘贴、鼠标模式、断开、进设置
 
