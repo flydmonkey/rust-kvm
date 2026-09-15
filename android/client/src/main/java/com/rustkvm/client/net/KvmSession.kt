@@ -52,6 +52,7 @@ class KvmSession(
 
     private val connectMutex = Mutex()
     private val stateLock = Any()
+    private val termination = CompletableDeferred<Throwable?>()
     private val sockets = mutableMapOf<SocketKind, WebSocket>()
     private var closed = false
 
@@ -80,10 +81,13 @@ class KvmSession(
     override fun sendSerialBinary(data: ByteArray): Boolean =
         synchronized(stateLock) { sockets[SocketKind.SERIAL] }?.send(data.toByteString()) ?: false
 
+    suspend fun awaitDisconnect(): Throwable? = termination.await()
+
     fun disconnect() {
         val openSockets = markClosed()
         openSockets.forEach { it.close(NORMAL_CLOSE_CODE, "Client disconnected") }
         closeChannels()
+        termination.complete(null)
     }
 
     override fun close() = disconnect()
@@ -188,6 +192,7 @@ class KvmSession(
         val openSockets = markClosed()
         openSockets.forEach(WebSocket::cancel)
         closeChannels(error)
+        termination.complete(error)
     }
 
     private fun terminateAudio(socket: WebSocket, error: Throwable?) {

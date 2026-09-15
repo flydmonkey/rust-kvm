@@ -91,6 +91,24 @@ class Ch9329(
         releaseAllKeys()
     }
 
+    internal fun pressUsage(code: Int, shifted: Boolean) {
+        write(
+            packet(
+                command = COMMAND_KEYBOARD,
+                data = intArrayOf(
+                    if (shifted) LEFT_SHIFT else 0x00,
+                    0x00,
+                    code,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                ),
+            ),
+        )
+    }
+
     private fun syncKeyboard() {
         val data = IntArray(8)
         data[0] = pressedModifiers.fold(0) { bits, key ->
@@ -127,6 +145,7 @@ class Ch9329(
         private const val COMMAND_MOUSE_RELATIVE = 0x05
         private const val HEADER_SIZE = 5
         private const val MAX_KEYS = 6
+        private const val LEFT_SHIFT = 0x02
 
         private val KEYBOARD_RELEASE_PACKET = byteArrayOf(
             0x57, 0xAB.toByte(), 0x00, 0x02, 0x08,

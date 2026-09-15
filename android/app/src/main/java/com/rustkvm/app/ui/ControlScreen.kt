@@ -5,11 +5,13 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +24,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -30,6 +33,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.rustkvm.app.ui.input.ch9329TouchInput
@@ -40,6 +44,7 @@ import com.rustkvm.client.hid.SerialControl
 import com.rustkvm.client.net.CertDecision
 import com.rustkvm.client.net.KvmHttpClient
 import com.rustkvm.client.net.KvmSession
+import com.rustkvm.client.net.ReconnectPolicy
 import com.rustkvm.client.video.VideoPipeline
 import com.rustkvm.protocol.CertTrustStore
 import com.rustkvm.protocol.KvmConfig
@@ -49,6 +54,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.IOException
 
@@ -56,6 +62,8 @@ import java.io.IOException
 fun ControlScreen(
     baseUrl: String,
     trustStore: CertTrustStore,
+    onDisconnect: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
 ) {
     var surface by remember { mutableStateOf<Surface?>(null) }
     var state by remember(baseUrl) { mutableStateOf<ControlState>(ControlState.Connecting) }
@@ -64,80 +72,97 @@ fun ControlScreen(
     var config by remember(baseUrl) { mutableStateOf<KvmConfig?>(null) }
     var serialControl by remember(baseUrl) { mutableStateOf<SerialControl<KvmSession>?>(null) }
     var serialBusy by remember(baseUrl) { mutableStateOf<ControlBusy?>(null) }
-    var takeoverSerial by remember(baseUrl) { mutableStateOf(false) }
+    var requestedTakeover by remember(baseUrl) { mutableStateOf(false) }
+    var connectionGeneration by remember(baseUrl) { mutableStateOf(0) }
     val pcmPlayer = remember(baseUrl) { PcmPlayer() }
     val focusRequester = remember(baseUrl) { FocusRequester() }
+    val clipboard = LocalClipboardManager.current
+    val uiScope = rememberCoroutineScope()
     SideEffect { pcmPlayer.muted = muted }
     DisposableEffect(pcmPlayer) {
         onDispose { pcmPlayer.close() }
     }
 
-    LaunchedEffect(baseUrl, surface, pcmPlayer, takeoverSerial) {
+    LaunchedEffect(baseUrl, surface, pcmPlayer, connectionGeneration) {
         val targetSurface = surface ?: return@LaunchedEffect
-        state = ControlState.Connecting
-        audioError = null
         val client = KvmHttpClient(
             baseUrl = baseUrl,
             trustStore = trustStore,
             onCertDecision = { decision -> rejectUnexpectedTrustDecision(decision) },
         )
-        var control: SerialControl<KvmSession>? = null
-        try {
-            val loadedConfig = client.getConfig()
-            config = loadedConfig
-            val activeControl = SerialControl(
-                sessionFactory = client::newSession,
-                settings = loadedConfig.serial,
-                onBusy = { serialBusy = it },
-            )
-            control = activeControl
-            serialControl = activeControl
-            val session = activeControl.open(takeover = takeoverSerial)
-            takeoverSerial = false
-            serialBusy = null
-            state = ControlState.Streaming
-            focusRequester.requestFocus()
-            coroutineScope {
-                launch {
-                    VideoPipeline(session, targetSurface).run()
-                }
-                launch {
-                    try {
-                        session.audioText.collect { text ->
-                            val header = parseAudioText(text)
-                            if (header != null) {
-                                pcmPlayer.onFormat(header)
-                                audioError = null
-                            } else {
-                                parseAudioError(text)?.let { audioError = it }
+        val reconnectPolicy = ReconnectPolicy()
+        var takeover = requestedTakeover
+        requestedTakeover = false
+        var firstAttempt = true
+        while (true) {
+            var control: SerialControl<KvmSession>? = null
+            try {
+                state = if (firstAttempt) ControlState.Connecting else ControlState.Reconnecting
+                audioError = null
+                val loadedConfig = client.getConfig()
+                config = loadedConfig
+                val activeControl = SerialControl(
+                    sessionFactory = client::newSession,
+                    settings = loadedConfig.serial,
+                    onBusy = { serialBusy = it },
+                )
+                control = activeControl
+                serialControl = activeControl
+                val session = activeControl.open(takeover = takeover)
+                takeover = false
+                reconnectPolicy.reset()
+                serialBusy = null
+                state = ControlState.Streaming
+                focusRequester.requestFocus()
+                coroutineScope {
+                    launch {
+                        VideoPipeline(session, targetSurface).run()
+                    }
+                    launch {
+                        try {
+                            session.audioText.collect { text ->
+                                val header = parseAudioText(text)
+                                if (header != null) {
+                                    pcmPlayer.onFormat(header)
+                                    audioError = null
+                                } else {
+                                    parseAudioError(text)?.let { audioError = it }
+                                }
                             }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            audioError = error.message ?: "音频播放不可用"
                         }
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (error: Exception) {
-                        audioError = error.message ?: "音频播放不可用"
+                    }
+                    launch(Dispatchers.IO) {
+                        try {
+                            session.audioBinary.collect(pcmPlayer::write)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            audioError = error.message ?: "音频流已断开"
+                        }
+                    }
+                    launch {
+                        throw (session.awaitDisconnect() ?: IOException("会话已断开"))
                     }
                 }
-                launch(Dispatchers.IO) {
-                    try {
-                        session.audioBinary.collect(pcmPlayer::write)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (error: Exception) {
-                        audioError = error.message ?: "音频流已断开"
-                    }
-                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (busy: ControlBusy) {
+                serialBusy = busy
+                state = ControlState.Failed("串口被其他客户端占用")
+                return@LaunchedEffect
+            } catch (error: Exception) {
+                takeover = false
+                state = ControlState.Reconnecting
+                delay(reconnectPolicy.nextDelayMs())
+                firstAttempt = false
+            } finally {
+                if (serialControl === control) serialControl = null
+                control?.close()
             }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (busy: ControlBusy) {
-            serialBusy = busy
-            state = ControlState.Failed("串口被其他客户端占用")
-        } catch (error: Exception) {
-            state = ControlState.Failed(error.message ?: "视频连接失败")
-        } finally {
-            if (serialControl === control) serialControl = null
-            control?.close()
         }
     }
 
@@ -192,24 +217,26 @@ fun ControlScreen(
         )
         when (val current = state) {
             ControlState.Connecting -> CircularProgressIndicator()
+            ControlState.Reconnecting -> Text(
+                text = "重连中…",
+                color = MaterialTheme.colorScheme.onSurface,
+            )
             is ControlState.Failed -> Text(
                 text = "连接失败：${current.message}",
                 color = MaterialTheme.colorScheme.error,
             )
             ControlState.Streaming -> Unit
         }
-        AudioToggle(
-            muted = muted,
-            onMutedChange = { muted = it },
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(16.dp),
-        )
         Row(
             modifier = Modifier
-                .align(Alignment.TopStart)
+                .align(Alignment.TopCenter)
+                .horizontalScroll(rememberScrollState())
                 .padding(8.dp),
         ) {
+            AudioToggle(
+                muted = muted,
+                onMutedChange = { muted = it },
+            )
             TextButton(onClick = {
                 runCatching { serialControl?.releaseAllKeys() }
                     .onFailure { state = ControlState.Failed(it.message ?: "按键释放失败") }
@@ -221,6 +248,36 @@ fun ControlScreen(
                     .onFailure { state = ControlState.Failed(it.message ?: "Ctrl+Alt+Del 发送失败") }
             }) {
                 Text("Ctrl+Alt+Del")
+            }
+            TextButton(onClick = {
+                val text = clipboard.getText()?.text.orEmpty()
+                if (text.isNotEmpty()) {
+                    uiScope.launch {
+                        runCatching { serialControl?.pasteText(text) }
+                            .onFailure { state = ControlState.Failed(it.message ?: "粘贴失败") }
+                    }
+                }
+            }) {
+                Text("粘贴")
+            }
+            TextButton(onClick = onOpenSettings) {
+                Text(
+                    if (currentConfig?.serial?.mouseMode == "relative") {
+                        "鼠标：相对"
+                    } else {
+                        "鼠标：绝对"
+                    },
+                )
+            }
+            TextButton(onClick = {
+                runCatching { serialControl?.releaseAllKeys() }
+                serialControl?.close()
+                onDisconnect()
+            }) {
+                Text("断开")
+            }
+            TextButton(onClick = onOpenSettings) {
+                Text("设置")
             }
         }
         audioError?.let { message ->
@@ -246,7 +303,8 @@ fun ControlScreen(
                 TextButton(
                     onClick = {
                         serialBusy = null
-                        takeoverSerial = true
+                        requestedTakeover = true
+                        connectionGeneration += 1
                     },
                 ) {
                     Text("接管")
@@ -357,6 +415,7 @@ private fun AndroidKeyEvent.toCh9329Key(): String? = when (keyCode) {
 
 private sealed interface ControlState {
     data object Connecting : ControlState
+    data object Reconnecting : ControlState
     data object Streaming : ControlState
     data class Failed(val message: String) : ControlState
 }

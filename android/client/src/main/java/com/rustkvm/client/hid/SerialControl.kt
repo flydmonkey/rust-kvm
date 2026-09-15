@@ -27,6 +27,7 @@ class SerialControl<S : SerialConnection>(
 ) : Closeable {
     private var connection: S? = null
     private var ch9329: Ch9329? = null
+    private var pasteTyper: PasteTyper? = null
 
     suspend fun open(takeover: Boolean = false): S {
         check(connection == null) { "Serial control is already open" }
@@ -53,7 +54,7 @@ class SerialControl<S : SerialConnection>(
             }
 
             connection = candidate
-            ch9329 = Ch9329(
+            val hid = Ch9329(
                 absoluteMouse = settings.mouseMode != "relative",
                 write = { frame ->
                     if (!candidate.sendSerialBinary(frame)) {
@@ -61,6 +62,8 @@ class SerialControl<S : SerialConnection>(
                     }
                 },
             )
+            ch9329 = hid
+            pasteTyper = PasteTyper(hid)
             return candidate
         } catch (error: Throwable) {
             candidate.close()
@@ -76,6 +79,9 @@ class SerialControl<S : SerialConnection>(
 
     fun ctrlAltDelete() = requireHid().ctrlAltDelete()
 
+    suspend fun pasteText(text: String): PasteResult =
+        checkNotNull(pasteTyper) { "Serial control is not open" }.typeText(text)
+
     fun mouseMoveAbsolute(nx: Float, ny: Float, buttons: Int) =
         requireHid().mouseMoveAbsolute(nx, ny, buttons)
 
@@ -83,6 +89,7 @@ class SerialControl<S : SerialConnection>(
         requireHid().mouseMoveRelative(dx, dy, buttons)
 
     override fun close() {
+        pasteTyper = null
         ch9329 = null
         connection?.close()
         connection = null
