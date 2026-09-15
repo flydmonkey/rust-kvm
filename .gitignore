@@ -21,3 +21,7 @@
 /frame.jpg
 /frame-y.pgm
 /frame-y.png
+
+# Git worktrees (local isolation)
+.worktrees/
+
