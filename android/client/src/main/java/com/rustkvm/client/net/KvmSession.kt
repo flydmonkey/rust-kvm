@@ -159,13 +159,22 @@ class KvmSession(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (!opened.completeExceptionally(t)) {
-                terminate(t)
+                if (kind == SocketKind.AUDIO) {
+                    terminateAudio(webSocket, t)
+                } else {
+                    terminate(t)
+                }
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (isCurrentSocket(kind, webSocket)) {
-                terminate(IOException("${kind.name.lowercase()} WebSocket closed: $code $reason"))
+                val error = IOException("${kind.name.lowercase()} WebSocket closed: $code $reason")
+                if (kind == SocketKind.AUDIO) {
+                    terminateAudio(webSocket, null)
+                } else {
+                    terminate(error)
+                }
             }
         }
     }
@@ -177,6 +186,20 @@ class KvmSession(
         val openSockets = markClosed()
         openSockets.forEach(WebSocket::cancel)
         closeChannels(error)
+    }
+
+    private fun terminateAudio(socket: WebSocket, error: Throwable?) {
+        val removed = synchronized(stateLock) {
+            if (!closed && sockets[SocketKind.AUDIO] === socket) {
+                sockets.remove(SocketKind.AUDIO)
+                true
+            } else {
+                false
+            }
+        }
+        if (!removed) return
+        audioTextChannel.close(error)
+        audioBinaryChannel.close(error)
     }
 
     private fun markClosed(): List<WebSocket> = synchronized(stateLock) {

@@ -54,6 +54,12 @@ fun parseAudioText(text: String): AudioFormatHeader? {
     return AudioFormatHeader(sampleRate = sampleRate, channels = channels, format = format)
 }
 
+fun parseAudioError(text: String): String? {
+    val obj = jsonObject(text) ?: return null
+    if (obj["op"]?.jsonPrimitive?.contentOrNull != "error") return null
+    return obj["message"]?.jsonPrimitive?.contentOrNull
+}
+
 fun parseSerialText(text: String): SerialText {
     val obj = jsonObject(text) ?: return SerialText.Unknown
     return when (obj["op"]?.jsonPrimitive?.contentOrNull) {

@@ -26,6 +26,13 @@ class WsMessagesTest {
     }
 
     @Test
+    fun parsesAudioError() {
+        val message = parseAudioError("""{"op":"error","message":"音频已禁用"}""")
+
+        assertEquals("音频已禁用", message)
+    }
+
+    @Test
     fun parsesSerialBusy() {
         val s = parseSerialText("""{"op":"error","message":"busy","code":"busy"}""") as SerialText.Error
         assertEquals("busy", s.code)

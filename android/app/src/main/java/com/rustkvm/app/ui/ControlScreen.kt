@@ -6,11 +6,14 @@ import android.view.SurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -19,12 +22,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.rustkvm.app.ui.components.AudioToggle
+import com.rustkvm.client.audio.PcmPlayer
 import com.rustkvm.client.net.CertDecision
 import com.rustkvm.client.net.KvmHttpClient
 import com.rustkvm.client.video.VideoPipeline
 import com.rustkvm.protocol.CertTrustStore
+import com.rustkvm.protocol.parseAudioError
+import com.rustkvm.protocol.parseAudioText
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 import java.io.IOException
 
 @Composable
@@ -34,10 +46,18 @@ fun ControlScreen(
 ) {
     var surface by remember { mutableStateOf<Surface?>(null) }
     var state by remember(baseUrl) { mutableStateOf<ControlState>(ControlState.Connecting) }
+    var muted by remember(baseUrl) { mutableStateOf(false) }
+    var audioError by remember(baseUrl) { mutableStateOf<String?>(null) }
+    val pcmPlayer = remember(baseUrl) { PcmPlayer() }
+    SideEffect { pcmPlayer.muted = muted }
+    DisposableEffect(pcmPlayer) {
+        onDispose { pcmPlayer.close() }
+    }
 
-    LaunchedEffect(baseUrl, surface) {
+    LaunchedEffect(baseUrl, surface, pcmPlayer) {
         val targetSurface = surface ?: return@LaunchedEffect
         state = ControlState.Connecting
+        audioError = null
         val client = KvmHttpClient(
             baseUrl = baseUrl,
             trustStore = trustStore,
@@ -47,7 +67,37 @@ fun ControlScreen(
         try {
             session.connect()
             state = ControlState.Streaming
-            VideoPipeline(session, targetSurface).run()
+            coroutineScope {
+                launch {
+                    VideoPipeline(session, targetSurface).run()
+                }
+                launch {
+                    try {
+                        session.audioText.collect { text ->
+                            val header = parseAudioText(text)
+                            if (header != null) {
+                                pcmPlayer.onFormat(header)
+                                audioError = null
+                            } else {
+                                parseAudioError(text)?.let { audioError = it }
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        audioError = error.message ?: "音频播放不可用"
+                    }
+                }
+                launch(Dispatchers.IO) {
+                    try {
+                        session.audioBinary.collect(pcmPlayer::write)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        audioError = error.message ?: "音频流已断开"
+                    }
+                }
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
@@ -74,6 +124,22 @@ fun ControlScreen(
                 color = MaterialTheme.colorScheme.error,
             )
             ControlState.Streaming -> Unit
+        }
+        AudioToggle(
+            muted = muted,
+            onMutedChange = { muted = it },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(16.dp),
+        )
+        audioError?.let { message ->
+            Text(
+                text = "音频不可用：$message",
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(16.dp),
+            )
         }
     }
 }
