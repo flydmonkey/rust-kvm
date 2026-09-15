@@ -8,9 +8,10 @@ import com.rustkvm.protocol.VideoText
 import com.rustkvm.protocol.parseVideoText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class VideoPipeline(
@@ -18,20 +19,45 @@ class VideoPipeline(
     private val surface: Surface,
 ) {
     suspend fun run() = withContext(Dispatchers.Default) {
-        coroutineScope {
-            val codec = MutableStateFlow<String?>(null)
-            launch {
-                session.videoText.collect { text ->
-                    when (val message = parseVideoText(text)) {
-                        is VideoText.Codec -> codec.value = message.codec.lowercase()
-                        is VideoText.Idle, VideoText.Unknown -> Unit
+        val stateLock = Mutex()
+        var selection: CodecSelection? = null
+        var h264Decoder: H264Decoder? = null
+        try {
+            coroutineScope {
+                launch {
+                    session.videoText.collect { text ->
+                        when (val message = parseVideoText(text)) {
+                            is VideoText.Codec -> stateLock.withLock {
+                                val next = CodecSelection(
+                                    codec = message.codec.lowercase(),
+                                    avcCodec = message.avcCodec,
+                                )
+                                if (next != selection) {
+                                    h264Decoder?.close()
+                                    h264Decoder = null
+                                    selection = next
+                                    if (next.codec == H264_CODEC && next.avcCodec != null) {
+                                        h264Decoder = H264Decoder(surface, next.avcCodec)
+                                    }
+                                }
+                            }
+
+                            is VideoText.Idle, VideoText.Unknown -> Unit
+                        }
+                    }
+                }
+                session.videoBinary.collect { bytes ->
+                    stateLock.withLock {
+                        when (selection?.codec) {
+                            MJPEG_CODEC -> render(bytes)
+                            H264_CODEC -> h264Decoder?.queue(bytes)
+                        }
                     }
                 }
             }
-            session.videoBinary.collect { bytes ->
-                if (codec.value == MJPEG_CODEC) {
-                    render(bytes)
-                }
+        } finally {
+            stateLock.withLock {
+                h264Decoder?.close()
             }
         }
     }
@@ -81,5 +107,11 @@ class VideoPipeline(
 
     private companion object {
         const val MJPEG_CODEC = "mjpeg"
+        const val H264_CODEC = "h264"
     }
+
+    private data class CodecSelection(
+        val codec: String,
+        val avcCodec: String?,
+    )
 }
