@@ -1,5 +1,6 @@
 package com.rustkvm.client.net
 
+import com.rustkvm.client.hid.SerialConnection
 import com.rustkvm.protocol.ProtocolPaths
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -22,7 +23,7 @@ import java.io.IOException
 class KvmSession(
     private val httpClient: KvmHttpClient,
     private val takeoverSerial: Boolean = false,
-) : Closeable {
+) : Closeable, SerialConnection {
     private val videoTextChannel = kotlinx.coroutines.channels.Channel<String>(
         kotlinx.coroutines.channels.Channel.UNLIMITED,
     )
@@ -46,15 +47,15 @@ class KvmSession(
     val videoBinary: Flow<ByteArray> = videoBinaryChannel.receiveAsFlow()
     val audioText: Flow<String> = audioTextChannel.receiveAsFlow()
     val audioBinary: Flow<ByteArray> = audioBinaryChannel.receiveAsFlow()
-    val serialText: Flow<String> = serialTextChannel.receiveAsFlow()
-    val serialBinary: Flow<ByteArray> = serialBinaryChannel.receiveAsFlow()
+    override val serialText: Flow<String> = serialTextChannel.receiveAsFlow()
+    override val serialBinary: Flow<ByteArray> = serialBinaryChannel.receiveAsFlow()
 
     private val connectMutex = Mutex()
     private val stateLock = Any()
     private val sockets = mutableMapOf<SocketKind, WebSocket>()
     private var closed = false
 
-    suspend fun connect() = connectMutex.withLock {
+    override suspend fun connect(): Unit = connectMutex.withLock {
         synchronized(stateLock) {
             check(!closed) { "Session is closed" }
             check(sockets.isEmpty()) { "Session is already connected" }
@@ -70,12 +71,13 @@ class KvmSession(
             terminate(error)
             throw error
         }
+        Unit
     }
 
-    fun sendSerialText(text: String): Boolean =
+    override fun sendSerialText(text: String): Boolean =
         synchronized(stateLock) { sockets[SocketKind.SERIAL] }?.send(text) ?: false
 
-    fun sendSerialBinary(data: ByteArray): Boolean =
+    override fun sendSerialBinary(data: ByteArray): Boolean =
         synchronized(stateLock) { sockets[SocketKind.SERIAL] }?.send(data.toByteString()) ?: false
 
     fun disconnect() {
