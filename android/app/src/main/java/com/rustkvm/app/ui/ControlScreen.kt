@@ -103,9 +103,7 @@ fun ControlScreen(
                 audioError = null
                 val loadedConfig = client.getConfig()
                 config = loadedConfig
-                if (absoluteMouse == null) {
-                    absoluteMouse = loadedConfig.serial.mouseMode != "relative"
-                }
+                absoluteMouse = loadedConfig.serial.mouseMode != "relative"
                 val activeControl = SerialControl(
                     sessionFactory = client::newSession,
                     settings = loadedConfig.serial,

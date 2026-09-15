@@ -42,4 +42,15 @@ class SettingsScreenTest {
     fun rejectsNonNumericDimensions() {
         SettingsForm.from(KvmConfig.DEFAULT).copy(width = "wide").toConfig()
     }
+
+    @Test
+    fun mjpegSkipsBitrateValidation() {
+        val config = SettingsForm.from(KvmConfig.DEFAULT).copy(
+            codec = "mjpeg",
+            bitrateKbps = "invalid",
+        ).toConfig()
+
+        assertEquals("mjpeg", config.video.codec)
+        assertEquals(KvmConfig.DEFAULT.video.bitrateKbps, config.video.bitrateKbps)
+    }
 }

@@ -14,3 +14,9 @@
 - `:core-protocol:testDebugUnitTest --tests com.rustkvm.protocol.ConfigModelsTest`：通过。
 - `:app:testDebugUnitTest --tests com.rustkvm.app.ui.SettingsScreenTest`：通过。
 - `.\gradlew.bat :app:assembleDebug :client:testDebugUnitTest`：通过。
+
+## P1/P2 修复
+
+- **P1**：`ControlScreen` 每次 `LaunchedEffect` 重载配置时，均从 `loadedConfig.serial.mouseMode` 同步 `absoluteMouse`（不再仅在 null 时设置），从设置页返回后鼠标模式与服务端一致。
+- **P2**：`SettingsForm.toConfig()` 在 codec 为 `mjpeg` 时跳过码率正整数校验，无效值回退默认 4000 kbps。
+- 新增 `mjpegSkipsBitrateValidation` 单元测试；`assembleDebug` 与全模块 `testDebugUnitTest` 通过（JDK 17）。

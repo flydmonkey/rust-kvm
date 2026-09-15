@@ -301,7 +301,11 @@ internal data class SettingsForm(
             height = height.positiveInt("高度"),
             fps = fps.positiveInt("帧率"),
             codec = codec,
-            bitrateKbps = bitrateKbps.positiveInt("码率"),
+            bitrateKbps = if (codec == "h264") {
+                bitrateKbps.positiveInt("码率")
+            } else {
+                bitrateKbps.toIntOrNull()?.takeIf { it > 0 } ?: KvmConfig.DEFAULT.video.bitrateKbps
+            },
         ),
         audio = AudioSettings(
             device = audioDevice,
