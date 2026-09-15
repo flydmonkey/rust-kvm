@@ -53,23 +53,35 @@ fun Modifier.ch9329TouchInput(
         }
 
         var previous = down.position
+        var dragging = false
+        val relativeMotion = RelativeMotionAccumulator()
         while (true) {
             val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
             val pressed = change.pressed
             if (absoluteMouse) {
-                val point = normalizeClamped(
-                    position = change.position,
-                    viewportWidth = size.width.toFloat(),
-                    viewportHeight = size.height.toFloat(),
-                    videoWidth = videoWidth.toFloat(),
-                    videoHeight = videoHeight.toFloat(),
-                )
-                onAbsolute(point.x, point.y, if (pressed) PRIMARY_BUTTON else 0)
+                if (pressed && !dragging) {
+                    dragging = hasExceededDragSlop(down.position, change.position)
+                }
+                if (dragging || !pressed) {
+                    val point = if (dragging) {
+                        normalizeClamped(
+                            position = change.position,
+                            viewportWidth = size.width.toFloat(),
+                            viewportHeight = size.height.toFloat(),
+                            videoWidth = videoWidth.toFloat(),
+                            videoHeight = videoHeight.toFloat(),
+                        )
+                    } else {
+                        initial
+                    }
+                    onAbsolute(point.x, point.y, if (pressed) PRIMARY_BUTTON else 0)
+                }
             } else {
                 val delta = change.position - previous
+                val rounded = relativeMotion.consume(delta.x, delta.y)
                 onRelative(
-                    delta.x.roundToInt(),
-                    delta.y.roundToInt(),
+                    rounded.dx,
+                    rounded.dy,
                     if (pressed) PRIMARY_BUTTON else 0,
                 )
             }
@@ -77,6 +89,29 @@ fun Modifier.ch9329TouchInput(
             change.consume()
             if (!pressed) break
         }
+    }
+}
+
+internal fun hasExceededDragSlop(
+    down: Offset,
+    current: Offset,
+    slopPx: Float = ABSOLUTE_DRAG_SLOP_PX,
+): Boolean = (current - down).getDistanceSquared() > slopPx * slopPx
+
+internal data class RelativeDelta(val dx: Int, val dy: Int)
+
+internal class RelativeMotionAccumulator {
+    private var residualX = 0f
+    private var residualY = 0f
+
+    fun consume(dx: Float, dy: Float): RelativeDelta {
+        val totalX = residualX + dx
+        val totalY = residualY + dy
+        val roundedX = totalX.roundToInt()
+        val roundedY = totalY.roundToInt()
+        residualX = totalX - roundedX
+        residualY = totalY - roundedY
+        return RelativeDelta(roundedX, roundedY)
     }
 }
 
@@ -125,3 +160,4 @@ private fun normalizeLetterboxedTouch(
 }
 
 private const val PRIMARY_BUTTON = 1
+private const val ABSOLUTE_DRAG_SLOP_PX = 6f

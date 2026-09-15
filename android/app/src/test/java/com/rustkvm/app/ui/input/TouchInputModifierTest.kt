@@ -1,7 +1,10 @@
 package com.rustkvm.app.ui.input
 
+import androidx.compose.ui.geometry.Offset
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TouchInputModifierTest {
@@ -47,5 +50,23 @@ class TouchInputModifierTest {
 
         assertEquals(1f, point?.x ?: -1f, 0.0001f)
         assertEquals(1f, point?.y ?: -1f, 0.0001f)
+    }
+
+    @Test
+    fun absoluteDragStartsOnlyAfterSixPixelDeadZone() {
+        val down = Offset(10f, 10f)
+
+        assertFalse(hasExceededDragSlop(down, Offset(14f, 14f)))
+        assertTrue(hasExceededDragSlop(down, Offset(17f, 10f)))
+    }
+
+    @Test
+    fun relativeMotionCarriesSubPixelResidual() {
+        val accumulator = RelativeMotionAccumulator()
+
+        assertEquals(RelativeDelta(0, 0), accumulator.consume(0.4f, 0.4f))
+        assertEquals(RelativeDelta(1, 1), accumulator.consume(0.4f, 0.4f))
+        assertEquals(RelativeDelta(0, 0), accumulator.consume(0.4f, 0.4f))
+        assertEquals(RelativeDelta(1, 1), accumulator.consume(0.4f, 0.4f))
     }
 }

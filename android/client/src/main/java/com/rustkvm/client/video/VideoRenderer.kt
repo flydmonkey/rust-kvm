@@ -2,6 +2,7 @@ package com.rustkvm.client.video
 
 import android.graphics.Color
 import android.graphics.Rect
+import android.util.Log
 import android.view.Surface
 import com.rustkvm.client.net.KvmSession
 import com.rustkvm.protocol.VideoText
@@ -76,7 +77,12 @@ class VideoPipeline(
         val bitmap = MjpegDecoder.decode(bytes) ?: return
         try {
             if (!surface.isValid) return
-            val canvas = runCatching { surface.lockCanvas(null) }.getOrNull() ?: return
+            val canvas = try {
+                surface.lockCanvas(null)
+            } catch (error: Exception) {
+                Log.w(TAG, "MJPEG Surface lockCanvas failed", error)
+                return
+            }
             try {
                 canvas.drawColor(Color.BLACK)
                 canvas.drawBitmap(
@@ -116,6 +122,7 @@ class VideoPipeline(
     }
 
     private companion object {
+        const val TAG = "VideoPipeline"
         const val MJPEG_CODEC = "mjpeg"
         const val H264_CODEC = "h264"
     }

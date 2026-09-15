@@ -41,6 +41,7 @@ import com.rustkvm.app.ui.components.AudioToggle
 import com.rustkvm.client.audio.PcmPlayer
 import com.rustkvm.client.hid.ControlBusy
 import com.rustkvm.client.hid.SerialControl
+import com.rustkvm.client.hid.SerialControlFailure
 import com.rustkvm.client.net.CertDecision
 import com.rustkvm.client.net.KvmHttpClient
 import com.rustkvm.client.net.KvmSession
@@ -95,11 +96,11 @@ fun ControlScreen(
         val reconnectPolicy = ReconnectPolicy()
         var takeover = requestedTakeover
         requestedTakeover = false
-        var firstAttempt = true
+        var hasStreamed = false
         while (!userDisconnected) {
             var control: SerialControl<KvmSession>? = null
             try {
-                state = if (firstAttempt) ControlState.Connecting else ControlState.Reconnecting
+                state = if (hasStreamed) ControlState.Reconnecting else ControlState.Connecting
                 audioError = null
                 val loadedConfig = client.getConfig()
                 config = loadedConfig
@@ -108,6 +109,11 @@ fun ControlScreen(
                     sessionFactory = client::newSession,
                     settings = loadedConfig.serial,
                     onBusy = { serialBusy = it },
+                    onInputFailure = { error ->
+                        uiScope.launch {
+                            state = ControlState.Failed(error.message ?: "串口输入发送失败")
+                        }
+                    },
                 )
                 control = activeControl
                 serialControl = activeControl
@@ -117,6 +123,7 @@ fun ControlScreen(
                 reconnectPolicy.reset()
                 serialBusy = null
                 state = ControlState.Streaming
+                hasStreamed = true
                 focusRequester.requestFocus()
                 coroutineScope {
                     launch {
@@ -149,6 +156,9 @@ fun ControlScreen(
                         }
                     }
                     launch {
+                        activeControl.monitorDownlink()
+                    }
+                    launch {
                         throw (session.awaitDisconnect() ?: IOException("会话已断开"))
                     }
                 }
@@ -158,13 +168,19 @@ fun ControlScreen(
                 serialBusy = busy
                 state = ControlState.Failed("串口被其他客户端占用")
                 return@LaunchedEffect
+            } catch (error: SerialControlFailure) {
+                state = ControlState.Failed(error.message ?: "串口连接失败")
+                return@LaunchedEffect
             } catch (error: Exception) {
                 if (userDisconnected) break
+                if (!shouldRetryControlConnection(hasStreamed, error)) {
+                    state = ControlState.Failed(error.message ?: "连接失败")
+                    return@LaunchedEffect
+                }
                 takeover = false
                 state = ControlState.Reconnecting
                 delay(reconnectPolicy.nextDelayMs())
                 if (userDisconnected) break
-                firstAttempt = false
             } finally {
                 if (serialControl === control) serialControl = null
                 control?.close()
@@ -365,13 +381,20 @@ private fun VideoSurface(
     )
 }
 
-private fun rejectUnexpectedTrustDecision(decision: CertDecision): Boolean =
+internal class TerminalControlConnectionException(message: String) : IOException(message)
+
+internal fun shouldRetryControlConnection(
+    hasStreamed: Boolean,
+    error: Exception,
+): Boolean = hasStreamed && error !is TerminalControlConnectionException
+
+internal fun rejectUnexpectedTrustDecision(decision: CertDecision): Boolean =
     when (decision) {
         CertDecision.Trusted -> true
-        is CertDecision.NeedsUserTrust -> throw IOException(
+        is CertDecision.NeedsUserTrust -> throw TerminalControlConnectionException(
             "服务器证书不在信任记录中，请返回连接页重新确认",
         )
-        is CertDecision.Mismatch -> throw IOException(
+        is CertDecision.Mismatch -> throw TerminalControlConnectionException(
             "服务器证书已变更，请返回连接页重新确认",
         )
     }

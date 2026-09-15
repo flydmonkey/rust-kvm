@@ -45,6 +45,24 @@ class Ch9329Test {
     }
 
     @Test
+    fun buttonTransitionsAreCommandsWhileMotionIsCoalescible() {
+        val commands = mutableListOf<ByteArray>()
+        val moves = mutableListOf<ByteArray>()
+        val ch = Ch9329(
+            absoluteMouse = true,
+            writeMove = { moves += it },
+            write = { commands += it },
+        )
+
+        ch.mouseMoveAbsolute(0.1f, 0.1f, buttons = 1)
+        ch.mouseMoveAbsolute(0.2f, 0.2f, buttons = 1)
+        ch.mouseMoveAbsolute(0.2f, 0.2f, buttons = 0)
+
+        assertEquals(2, commands.size)
+        assertEquals(1, moves.size)
+    }
+
+    @Test
     fun keyboardPacketsTrackKeysAndModifiers() {
         val frames = mutableListOf<ByteArray>()
         val ch = Ch9329(absoluteMouse = true) { frames += it }

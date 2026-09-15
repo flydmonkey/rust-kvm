@@ -19,6 +19,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.security.SecureRandom
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 
@@ -42,6 +43,7 @@ class KvmHttpClient(
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             // The pinned certificate is the server identity, including for IP/self-signed certificates.
             .hostnameVerifier { _, _ -> true }
+            .pingInterval(20, TimeUnit.SECONDS)
             .build()
     }
 

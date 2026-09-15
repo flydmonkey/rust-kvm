@@ -9,11 +9,13 @@ import kotlin.math.floor
  */
 class Ch9329(
     absoluteMouse: Boolean,
+    private val writeMove: ((ByteArray) -> Unit)? = null,
     private val write: (ByteArray) -> Unit,
 ) {
     var absoluteMouse: Boolean = absoluteMouse
     private val pressedKeys = mutableListOf<Int>()
     private val pressedModifiers = mutableSetOf<String>()
+    private var mouseButtons = 0
 
     fun keydown(key: String) {
         val modifier = Ch9329Maps.CONTROL_KEY_BITS[key]
@@ -51,7 +53,7 @@ class Ch9329(
     fun mouseMoveAbsolute(nx: Float, ny: Float, buttons: Int) {
         val x = absoluteCoordinate(nx)
         val y = absoluteCoordinate(ny)
-        write(
+        mouseWriter(buttons)(
             packet(
                 command = COMMAND_MOUSE_ABSOLUTE,
                 data = intArrayOf(
@@ -68,7 +70,7 @@ class Ch9329(
     }
 
     fun mouseMoveRelative(dx: Int, dy: Int, buttons: Int) {
-        write(
+        mouseWriter(buttons)(
             packet(
                 command = COMMAND_MOUSE_RELATIVE,
                 data = intArrayOf(
@@ -120,6 +122,14 @@ class Ch9329(
         }
         write(packet(COMMAND_KEYBOARD, data))
     }
+
+    private fun mouseWriter(buttons: Int): (ByteArray) -> Unit =
+        if (buttons != mouseButtons) {
+            mouseButtons = buttons
+            write
+        } else {
+            writeMove ?: write
+        }
 
     private fun packet(command: Int, data: IntArray): ByteArray {
         val frame = IntArray(HEADER_SIZE + data.size)

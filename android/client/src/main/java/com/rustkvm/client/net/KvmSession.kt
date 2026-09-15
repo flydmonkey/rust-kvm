@@ -6,6 +6,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -39,8 +41,9 @@ class KvmSession(
     private val serialTextChannel = kotlinx.coroutines.channels.Channel<String>(
         kotlinx.coroutines.channels.Channel.UNLIMITED,
     )
-    private val serialBinaryChannel = kotlinx.coroutines.channels.Channel<ByteArray>(
-        kotlinx.coroutines.channels.Channel.UNLIMITED,
+    private val serialBinaryChannel = Channel<ByteArray>(
+        capacity = SERIAL_BINARY_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
     val videoText: Flow<String> = videoTextChannel.receiveAsFlow()
@@ -234,5 +237,6 @@ class KvmSession(
 
     private companion object {
         const val NORMAL_CLOSE_CODE = 1000
+        const val SERIAL_BINARY_CAPACITY = 64
     }
 }
