@@ -13,3 +13,8 @@
 - 单元测试覆盖 open/takeover 参数、busy 回调及会话关闭、CH9329 二进制上行、letterbox 边界与坐标归一化。
 - JDK 17 下执行 `.\gradlew.bat testDebugUnitTest assembleDebug --no-daemon`：`BUILD SUCCESSFUL`。
 - 未连接实体串口设备，live device smoke 按任务说明跳过。
+
+## P2 修复
+
+- `SerialControl.open()` 成功后重置 `takeoverSerial = false`，避免旋转/表面重建时反复携带 `?takeover=1`。
+- 串口 busy 对话框弹出时退出 `Connecting` 状态，不再显示加载圈。

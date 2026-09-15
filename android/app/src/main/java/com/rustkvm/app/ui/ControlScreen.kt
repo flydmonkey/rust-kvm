@@ -93,6 +93,7 @@ fun ControlScreen(
             control = activeControl
             serialControl = activeControl
             val session = activeControl.open(takeover = takeoverSerial)
+            takeoverSerial = false
             serialBusy = null
             state = ControlState.Streaming
             focusRequester.requestFocus()
@@ -131,6 +132,7 @@ fun ControlScreen(
             throw cancelled
         } catch (busy: ControlBusy) {
             serialBusy = busy
+            state = ControlState.Failed("串口被其他客户端占用")
         } catch (error: Exception) {
             state = ControlState.Failed(error.message ?: "视频连接失败")
         } finally {
