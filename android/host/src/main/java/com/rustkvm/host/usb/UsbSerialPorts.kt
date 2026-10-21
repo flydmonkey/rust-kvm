@@ -1,11 +1,8 @@
 package com.rustkvm.host.usb
 
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
-import android.os.Build
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
@@ -28,15 +25,9 @@ class UsbSerialPorts(context: Context) : SerialPorts {
     /** 列给控制端的只有已授权的口：没授权的打不开，列出来只会让客户端挑中它然后失败。 */
     override fun list(): List<SerialDevice> = entries().filter { it.hasPermission }.map { it.device }
 
-    /** 弹系统的 USB 授权框。结果不用回调拿：页面定时刷新 [entries] 就能看到。 */
     fun requestPermission(name: String) {
         val driver = drivers().firstOrNull { it.device.deviceName == name } ?: return
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
-        val intent = Intent(ACTION_USB_PERMISSION).setPackage(appContext.packageName)
-        usbManager.requestPermission(
-            driver.device,
-            PendingIntent.getBroadcast(appContext, 0, intent, flags),
-        )
+        requestUsbPermission(appContext, usbManager, driver.device)
     }
 
     override fun open(name: String, baudRate: Int): RawSerialPort {
@@ -85,7 +76,6 @@ class UsbSerialPorts(context: Context) : SerialPorts {
     }
 
     private companion object {
-        const val ACTION_USB_PERMISSION = "com.rustkvm.host.USB_PERMISSION"
         const val WRITE_TIMEOUT_MS = 1_000
     }
 }

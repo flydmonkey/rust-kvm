@@ -1,6 +1,7 @@
 package com.rustkvm.host.serial
 
 import com.rustkvm.host.config.HostConfigStore
+import com.rustkvm.host.video.idleVideoHub
 import com.rustkvm.host.server.HostDependencies
 import com.rustkvm.host.server.hostModule
 import io.ktor.client.HttpClient
@@ -207,6 +208,7 @@ class SerialBridgeTest {
                     serialHub = hub,
                     certPem = { "" },
                     webAssets = { null },
+                    video = idleVideoHub(),
                 ),
             )
         }

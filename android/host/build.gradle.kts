@@ -13,7 +13,15 @@ val copyWebAssets by tasks.registering(Sync::class) {
 android {
     namespace = "com.rustkvm.host"
     compileSdk = 35
+    ndkVersion = "27.0.12077973"
     defaultConfig { minSdk = 26 }
+    // 采集卡的等时传输 Java API 做不了，这一小段走 JNI
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

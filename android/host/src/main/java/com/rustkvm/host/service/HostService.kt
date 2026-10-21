@@ -22,6 +22,8 @@ import com.rustkvm.host.server.HostDependencies
 import com.rustkvm.host.server.HostServer
 import com.rustkvm.host.tls.SelfSignedCert
 import com.rustkvm.host.usb.UsbSerialPorts
+import com.rustkvm.host.usb.UvcVideoDevices
+import com.rustkvm.host.video.VideoHub
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -46,6 +48,7 @@ sealed interface HostState {
 class HostService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var server: HostServer? = null
+    private var video: VideoHub? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -70,12 +73,15 @@ class HostService : Service() {
         mutableState.value = HostState.Starting
         try {
             val cert = SelfSignedCert.loadOrCreate(File(filesDir, "tls"))
+            val config = HostConfigStore(File(filesDir, "config.json"))
+            val hub = VideoHub(UvcVideoDevices(this), config.get().video).also { video = it }
             val deps = HostDependencies(
-                config = HostConfigStore(File(filesDir, "config.json")),
+                config = config,
                 serialPorts = UsbSerialPorts(this),
                 serialHub = SerialHub(),
                 certPem = { cert.certPem },
                 webAssets = AndroidWebAssets(assets),
+                video = hub,
             )
             val started = HostServer(deps, cert).also { it.start() }
             server = started
@@ -95,6 +101,8 @@ class HostService : Service() {
     override fun onDestroy() {
         runCatching { server?.stop() }
         server = null
+        runCatching { video?.close() }
+        video = null
         releaseLocks()
         scope.cancel()
         if (mutableState.value !is HostState.Failed) mutableState.value = HostState.Stopped

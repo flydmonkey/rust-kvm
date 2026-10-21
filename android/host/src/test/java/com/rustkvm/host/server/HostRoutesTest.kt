@@ -3,8 +3,11 @@ package com.rustkvm.host.server
 import com.rustkvm.host.config.HostConfigStore
 import com.rustkvm.host.serial.FakeSerialPorts
 import com.rustkvm.host.serial.SerialHub
+import com.rustkvm.host.video.FakeVideoDevices
+import com.rustkvm.host.video.VideoHub
 import com.rustkvm.protocol.KvmConfig
 import com.rustkvm.protocol.SerialSettings
+import com.rustkvm.protocol.VideoSettings
 import com.rustkvm.protocol.encodeConfig
 import com.rustkvm.protocol.parseConfig
 import com.rustkvm.protocol.parseDevices
@@ -35,6 +38,7 @@ class HostRoutesTest {
     val temp = TemporaryFolder()
 
     private val ports = FakeSerialPorts()
+    private val videoDevices = FakeVideoDevices()
     private val assets = mapOf(
         "index.html" to "<html>kvm</html>",
         "input.js" to "console.log(1)",
@@ -62,15 +66,17 @@ class HostRoutesTest {
     }
 
     @Test
-    fun devicesListSerialPortsAndExplainMissingCapture() = routesTest {
+    fun devicesListUsbDevicesAndExplainMissingOnes() = routesTest {
         val devices = parseDevices(client.get("/api/devices").bodyAsText())
         assertEquals(listOf("/dev/bus/usb/001/002"), devices.serial.items.map { it.name })
-        assertTrue(devices.video.items.isEmpty() && devices.video.error != null)
+        assertEquals(listOf("USB Video"), devices.video.items.map { it.name })
         assertTrue(devices.audio.items.isEmpty() && devices.audio.error != null)
 
         ports.devices = emptyList()
+        videoDevices.devices = emptyList()
         val empty = parseDevices(client.get("/api/devices").bodyAsText())
         assertTrue(empty.serial.error!!.contains("OTG"))
+        assertTrue(empty.video.error!!.contains("采集卡"))
     }
 
     @Test
@@ -128,6 +134,7 @@ class HostRoutesTest {
                         serialHub = SerialHub(),
                         certPem = { "PEM" },
                         webAssets = { path -> assets[path]?.toByteArray() },
+                        video = VideoHub(videoDevices, VideoSettings()),
                     ),
                 )
             }

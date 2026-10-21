@@ -4,6 +4,7 @@ import com.rustkvm.client.hid.SerialControl
 import com.rustkvm.client.net.CertDecision
 import com.rustkvm.client.net.KvmHttpClient
 import com.rustkvm.host.config.HostConfigStore
+import com.rustkvm.host.video.idleVideoHub
 import com.rustkvm.host.serial.FakeSerialPorts
 import com.rustkvm.host.serial.SerialHub
 import com.rustkvm.host.tls.SelfSignedCert
@@ -42,6 +43,7 @@ class HostServerEndToEndTest {
                 serialHub = SerialHub(),
                 certPem = { cert.certPem },
                 webAssets = { null },
+                video = idleVideoHub(),
             ),
             cert = cert,
             port = 0,
@@ -87,6 +89,7 @@ class HostServerEndToEndTest {
                 serialHub = SerialHub(),
                 certPem = { cert.certPem },
                 webAssets = { null },
+                video = idleVideoHub(),
             ),
             cert = cert,
             port = 0,

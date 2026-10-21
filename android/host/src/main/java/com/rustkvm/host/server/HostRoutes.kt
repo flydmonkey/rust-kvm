@@ -4,6 +4,9 @@ import com.rustkvm.host.config.HostConfigStore
 import com.rustkvm.host.serial.SerialHub
 import com.rustkvm.host.serial.SerialPorts
 import com.rustkvm.host.serial.runSerialBridge
+import com.rustkvm.host.video.VideoHub
+import com.rustkvm.host.video.VideoStats
+import com.rustkvm.host.video.runVideoStream
 import com.rustkvm.protocol.DeviceList
 import com.rustkvm.protocol.KvmDevices
 import com.rustkvm.protocol.encodeConfig
@@ -29,6 +32,8 @@ import io.ktor.server.websocket.pingPeriod
 import io.ktor.server.websocket.webSocket
 import io.ktor.websocket.Frame
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.time.Duration.Companion.seconds
@@ -39,9 +44,10 @@ class HostDependencies(
     val serialHub: SerialHub,
     val certPem: () -> String,
     val webAssets: WebAssets,
+    val video: VideoHub,
 )
 
-internal const val VIDEO_UNAVAILABLE = "Android 宿主机还不支持采集卡（二期 2b）"
+internal const val NO_CAPTURE_DEVICE = "没有找到 USB 采集卡。用 OTG 接上采集卡后，在宿主机页面点「授权」。"
 internal const val AUDIO_UNAVAILABLE = "Android 宿主机还不支持音频（二期 2c）"
 
 /** 与 `src/main.rs` 的路由同形，浏览器 `web/` 和 Android 客户端都不需要为它开特例。 */
@@ -59,10 +65,7 @@ fun Application.hostModule(deps: HostDependencies) {
             val takeover = call.request.queryParameters["takeover"].let { it == "1" || it == "true" }
             runSerialBridge(deps.serialHub, deps.serialPorts, takeover)
         }
-        // 2a 还没有采集：连接照收（客户端三路一起连，拒掉视频整个会话就进不来），只是不出画面
-        webSocket("/ws/video") {
-            for (frame in incoming) Unit
-        }
+        webSocket("/ws/video") { runVideoStream(deps.video) }
         webSocket("/ws/audio") {
             send(Frame.Text(buildJsonObject { put("op", "error"); put("message", AUDIO_UNAVAILABLE) }.toString()))
             for (frame in incoming) Unit
@@ -83,6 +86,7 @@ fun Application.hostModule(deps: HostDependencies) {
                 return@put
             }
             // 串口不在这儿热切换：口由控制端通过 /ws/serial 的 open 打开，配置只是默认值
+            deps.video.updateSettings(config.video)
             call.respondJson(encodeConfig(config))
         }
         // 每次请求都重新枚举：USB 设备会被插拔，列表过期了就选不到设备
@@ -90,7 +94,7 @@ fun Application.hostModule(deps: HostDependencies) {
             call.respondJson(
                 encodeDevices(
                     KvmDevices(
-                        video = DeviceList(error = VIDEO_UNAVAILABLE),
+                        video = videoDeviceList(deps.video),
                         audio = DeviceList(error = AUDIO_UNAVAILABLE),
                         serial = serialDeviceList(deps.serialPorts),
                     ),
@@ -100,7 +104,7 @@ fun Application.hostModule(deps: HostDependencies) {
         get("/api/serial/ports") {
             call.respondJson(encodeSerialDevices(runCatching { deps.serialPorts.list() }.getOrDefault(emptyList())))
         }
-        get("/api/video/stats") { call.respondJson(videoStatsJson()) }
+        get("/api/video/stats") { call.respondJson(videoStatsJson(deps.video.stats())) }
         get("/api/audio/stats") { call.respondJson(audioStatsJson()) }
         get("/cert.crt") {
             call.response.header(HttpHeaders.ContentDisposition, "attachment; filename=\"rust-kvm.crt\"")
@@ -129,17 +133,27 @@ private fun serialDeviceList(ports: SerialPorts) = runCatching { ports.list() }.
     onFailure = { DeviceList(error = "枚举 USB 串口失败：${it.message}") },
 )
 
+private fun videoDeviceList(hub: VideoHub) = runCatching { hub.listDevices() }.fold(
+    onSuccess = { items -> if (items.isEmpty()) DeviceList(error = NO_CAPTURE_DEVICE) else DeviceList(items = items) },
+    onFailure = { DeviceList(error = "枚举采集卡失败：${it.message}") },
+)
+
 // 字段与 src/video.rs 的 VideoStats、src/audio.rs 的 AudioStats 一致，网页直接读这些字段
-private fun videoStatsJson(): String = buildJsonObject {
-    put("capturing", false)
-    put("viewers", 0)
-    put("fps", 0)
-    put("mbps", 0)
-    put("sentMbps", 0)
-    put("frames", 0)
-    put("lastFrameBytes", 0)
-    put("resolution", JsonNull)
-    put("error", VIDEO_UNAVAILABLE)
+private fun videoStatsJson(stats: VideoStats): String = buildJsonObject {
+    put("capturing", stats.capturing)
+    put("viewers", stats.viewers)
+    put("fps", stats.fps)
+    put("mbps", stats.mbps)
+    put("sentMbps", stats.sentMbps)
+    put("frames", stats.frames)
+    put("lastFrameBytes", stats.lastFrameBytes)
+    val resolution = stats.resolution
+    if (resolution == null) {
+        put("resolution", JsonNull)
+    } else {
+        put("resolution", buildJsonArray { add(resolution.first); add(resolution.second) })
+    }
+    if (stats.error == null) put("error", JsonNull) else put("error", stats.error)
 }.toString()
 
 private fun audioStatsJson(): String = buildJsonObject {
