@@ -9,6 +9,7 @@ import java.nio.ByteBuffer
 
 class H264Decoder(
     private val surface: Surface,
+    private val onOutputSize: (width: Int, height: Int) -> Unit = { _, _ -> },
 ) : Closeable {
     private var codec: MediaCodec? = null
     private var sps: ByteArray? = null
@@ -136,7 +137,7 @@ class H264Decoder(
         while (true) {
             when (val outputIndex = decoder.dequeueOutputBuffer(info, NO_WAIT)) {
                 MediaCodec.INFO_TRY_AGAIN_LATER -> return
-                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
+                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> reportOutputSize(decoder.outputFormat)
                 else -> {
                     if (outputIndex < 0) return
                     decoder.releaseOutputBuffer(outputIndex, true)
@@ -145,7 +146,26 @@ class H264Decoder(
         }
     }
 
+    /** 1080p 编码时宽高按宏块对齐成 1088，真实画面要看 crop 矩形。 */
+    private fun reportOutputSize(format: MediaFormat) {
+        val width = if (format.containsKey(KEY_CROP_RIGHT) && format.containsKey(KEY_CROP_LEFT)) {
+            format.getInteger(KEY_CROP_RIGHT) - format.getInteger(KEY_CROP_LEFT) + 1
+        } else {
+            format.getInteger(MediaFormat.KEY_WIDTH)
+        }
+        val height = if (format.containsKey(KEY_CROP_BOTTOM) && format.containsKey(KEY_CROP_TOP)) {
+            format.getInteger(KEY_CROP_BOTTOM) - format.getInteger(KEY_CROP_TOP) + 1
+        } else {
+            format.getInteger(MediaFormat.KEY_HEIGHT)
+        }
+        if (width > 0 && height > 0) onOutputSize(width, height)
+    }
+
     private companion object {
+        const val KEY_CROP_LEFT = "crop-left"
+        const val KEY_CROP_RIGHT = "crop-right"
+        const val KEY_CROP_TOP = "crop-top"
+        const val KEY_CROP_BOTTOM = "crop-bottom"
         const val MIME_AVC = "video/avc"
         const val NAL_IDR = 5
         const val NAL_SPS = 7

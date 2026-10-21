@@ -14,10 +14,23 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
+/**
+ * [onVideoSize] 报的是实际解码出的画面尺寸，不是配置里请求的尺寸——采集卡按「最接近」
+ * 协商，两者可能不同，而触摸坐标换算和画面比例都得以实际为准。
+ */
 class VideoPipeline(
     private val session: KvmSession,
     private val surface: Surface,
+    private val onVideoSize: (width: Int, height: Int) -> Unit = { _, _ -> },
 ) {
+    private var reportedSize = 0 to 0
+
+    private fun reportSize(width: Int, height: Int) {
+        if (reportedSize == width to height) return
+        reportedSize = width to height
+        onVideoSize(width, height)
+    }
+
     suspend fun run() = withContext(Dispatchers.Default) {
         var codec: String? = null
         var h264Decoder: H264Decoder? = null
@@ -56,7 +69,7 @@ class VideoPipeline(
                                 h264Decoder?.close()
                                 codec = parsed.codec.lowercase()
                                 h264Decoder = if (codec == H264_CODEC && parsed.avcCodec != null) {
-                                    H264Decoder(surface)
+                                    H264Decoder(surface, ::reportSize)
                                 } else {
                                     null
                                 }
@@ -83,6 +96,7 @@ class VideoPipeline(
 
     private fun render(bytes: ByteArray) {
         val bitmap = MjpegDecoder.decode(bytes) ?: return
+        reportSize(bitmap.width, bitmap.height)
         try {
             if (!surface.isValid) return
             val canvas = try {

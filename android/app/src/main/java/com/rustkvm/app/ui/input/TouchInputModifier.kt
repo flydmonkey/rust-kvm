@@ -27,67 +27,57 @@ fun normalizeLetterboxedTouch(
     clamp = false,
 )
 
+/**
+ * [sink] 必须在重组之间保持同一个实例：它是 pointerInput 的 key，换实例会打断进行中的手势。
+ */
 fun Modifier.ch9329TouchInput(
     videoWidth: Int,
     videoHeight: Int,
     absoluteMouse: Boolean,
-    onAbsolute: (x: Float, y: Float, buttons: Int) -> Unit,
-    onRelative: (dx: Int, dy: Int, buttons: Int) -> Unit,
-): Modifier = pointerInput(videoWidth, videoHeight, absoluteMouse, onAbsolute, onRelative) {
+    sink: PointerSink,
+): Modifier = pointerInput(videoWidth, videoHeight, absoluteMouse, sink) {
+    val longPressMs = viewConfiguration.longPressTimeoutMillis
+    val slopPx = viewConfiguration.touchSlop
+    val scrollPxPerNotch = SCROLL_DP_PER_NOTCH * density
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
-        val initial = normalizeLetterboxedTouch(
-            x = down.position.x,
-            y = down.position.y,
-            viewportWidth = size.width.toFloat(),
-            viewportHeight = size.height.toFloat(),
-            videoWidth = videoWidth.toFloat(),
-            videoHeight = videoHeight.toFloat(),
-        ) ?: return@awaitEachGesture
-
-        down.consume()
-        if (absoluteMouse) {
-            onAbsolute(initial.x, initial.y, PRIMARY_BUTTON)
-        } else {
-            onRelative(0, 0, PRIMARY_BUTTON)
-        }
-
-        var previous = down.position
-        var dragging = false
-        val relativeMotion = RelativeMotionAccumulator()
-        while (true) {
-            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-            val pressed = change.pressed
-            if (absoluteMouse) {
-                if (pressed && !dragging) {
-                    dragging = hasExceededDragSlop(down.position, change.position)
-                }
-                if (dragging || !pressed) {
-                    val point = if (dragging) {
-                        normalizeClamped(
-                            position = change.position,
-                            viewportWidth = size.width.toFloat(),
-                            viewportHeight = size.height.toFloat(),
-                            videoWidth = videoWidth.toFloat(),
-                            videoHeight = videoHeight.toFloat(),
-                        )
-                    } else {
-                        initial
-                    }
-                    onAbsolute(point.x, point.y, if (pressed) PRIMARY_BUTTON else 0)
-                }
-            } else {
-                val delta = change.position - previous
-                val rounded = relativeMotion.consume(delta.x, delta.y)
-                onRelative(
-                    rounded.dx,
-                    rounded.dy,
-                    if (pressed) PRIMARY_BUTTON else 0,
+        val interpreter = TouchGestureInterpreter(
+            absoluteMouse = absoluteMouse,
+            normalize = { position, clamp ->
+                normalizeLetterboxedTouch(
+                    x = position.x,
+                    y = position.y,
+                    viewportWidth = size.width.toFloat(),
+                    viewportHeight = size.height.toFloat(),
+                    videoWidth = videoWidth.toFloat(),
+                    videoHeight = videoHeight.toFloat(),
+                    clamp = clamp,
                 )
+            },
+            sink = sink,
+            slopPx = slopPx,
+            scrollPxPerNotch = scrollPxPerNotch,
+        )
+        interpreter.onEvent(listOf(TouchPoint(down.id.value, down.position, pressed = true)))
+        down.consume()
+
+        var lastUptime = down.uptimeMillis
+        while (!interpreter.finished) {
+            val event = if (interpreter.awaitingLongPress) {
+                val remaining = longPressMs - (lastUptime - down.uptimeMillis)
+                withTimeoutOrNull(remaining.coerceAtLeast(1)) { awaitPointerEvent() }
+            } else {
+                awaitPointerEvent()
             }
-            previous = change.position
-            change.consume()
-            if (!pressed) break
+            if (event == null) {
+                interpreter.onLongPress()
+                continue
+            }
+            lastUptime = event.changes.maxOf { it.uptimeMillis }
+            interpreter.onEvent(
+                event.changes.map { TouchPoint(it.id.value, it.position, it.pressed) },
+            )
+            event.changes.forEach { it.consume() }
         }
     }
 }
@@ -115,24 +105,6 @@ internal class RelativeMotionAccumulator {
     }
 }
 
-private fun normalizeClamped(
-    position: Offset,
-    viewportWidth: Float,
-    viewportHeight: Float,
-    videoWidth: Float,
-    videoHeight: Float,
-): NormalizedTouch = checkNotNull(
-    normalizeLetterboxedTouch(
-        x = position.x,
-        y = position.y,
-        viewportWidth = viewportWidth,
-        viewportHeight = viewportHeight,
-        videoWidth = videoWidth,
-        videoHeight = videoHeight,
-        clamp = true,
-    ),
-)
-
 private fun normalizeLetterboxedTouch(
     x: Float,
     y: Float,
@@ -159,5 +131,5 @@ private fun normalizeLetterboxedTouch(
     )
 }
 
-private const val PRIMARY_BUTTON = 1
-private const val ABSOLUTE_DRAG_SLOP_PX = 6f
+/** 浏览器按 100px 一格；手指比滚轮慢得多，按 16dp 一格才不至于要划好几屏。 */
+private const val SCROLL_DP_PER_NOTCH = 16f

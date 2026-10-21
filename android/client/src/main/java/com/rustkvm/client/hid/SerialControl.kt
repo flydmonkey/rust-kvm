@@ -131,6 +131,14 @@ class SerialControl<S : SerialConnection>(
     fun mouseMoveRelative(dx: Int, dy: Int, buttons: Int) =
         requireHid().mouseMoveRelative(dx, dy, buttons)
 
+    fun mouseScroll(notches: Int) = requireHid().mouseScroll(notches)
+
+    fun pressKey(key: String) {
+        val hid = requireHid()
+        hid.keydown(key)
+        hid.keyup(key)
+    }
+
     fun setAbsoluteMouse(absolute: Boolean) {
         absoluteMouseOverride = absolute
         ch9329?.absoluteMouse = absolute

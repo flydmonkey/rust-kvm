@@ -7,11 +7,15 @@ import android.view.SurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -29,14 +33,25 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.rustkvm.app.ui.input.KEYBOARD_SENTINEL
+import com.rustkvm.app.ui.input.KeyboardEdit
+import com.rustkvm.app.ui.input.NormalizedTouch
+import com.rustkvm.app.ui.input.PointerSink
 import com.rustkvm.app.ui.input.ch9329TouchInput
+import com.rustkvm.app.ui.input.diffKeyboardInput
+import com.rustkvm.app.ui.input.nextKeyboardSentinel
 import com.rustkvm.app.ui.components.AudioToggle
 import com.rustkvm.client.audio.PcmPlayer
 import com.rustkvm.client.audio.trimAudioBacklog
@@ -56,6 +71,7 @@ import com.rustkvm.protocol.parseAudioError
 import com.rustkvm.protocol.parseAudioText
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.delay
@@ -80,13 +96,54 @@ fun ControlScreen(
     var userDisconnected by remember(baseUrl) { mutableStateOf(false) }
     var absoluteMouse by remember(baseUrl) { mutableStateOf<Boolean?>(null) }
     var connectionGeneration by remember(baseUrl) { mutableStateOf(0) }
+    var videoSize by remember(baseUrl) { mutableStateOf<Pair<Int, Int>?>(null) }
     val pcmPlayer = remember(baseUrl) { PcmPlayer() }
     val focusRequester = remember(baseUrl) { FocusRequester() }
+    val keyboardFocus = remember(baseUrl) { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var keyboardSentinel by remember(baseUrl) { mutableStateOf(KEYBOARD_SENTINEL) }
+    var keyboardField by remember(baseUrl) {
+        mutableStateOf(TextFieldValue(KEYBOARD_SENTINEL, TextRange(KEYBOARD_SENTINEL.length)))
+    }
+    val keyboardEdits = remember(baseUrl) { Channel<KeyboardEdit>(Channel.UNLIMITED) }
     val clipboard = LocalClipboardManager.current
     val uiScope = rememberCoroutineScope()
     SideEffect { pcmPlayer.muted = muted }
     DisposableEffect(pcmPlayer) {
         onDispose { pcmPlayer.close() }
+    }
+
+    val pointerSink = remember(baseUrl) {
+        object : PointerSink {
+            override fun absolute(point: NormalizedTouch, buttons: Int) =
+                send { it.mouseMoveAbsolute(point.x, point.y, buttons) }
+
+            override fun relative(dx: Int, dy: Int, buttons: Int) =
+                send { it.mouseMoveRelative(dx, dy, buttons) }
+
+            override fun scroll(notches: Int) = send { it.mouseScroll(notches) }
+
+            private fun send(action: (SerialControl<KvmSession>) -> Unit) {
+                val control = serialControl ?: return
+                runCatching { action(control) }
+                    .onFailure { state = ControlState.Failed(it.message ?: "触摸输入发送失败") }
+            }
+        }
+    }
+
+    // 软键盘的编辑必须按顺序逐个敲完：并发敲的话两段文字的按键会交错
+    LaunchedEffect(keyboardEdits) {
+        for (edit in keyboardEdits) {
+            val control = serialControl ?: continue
+            try {
+                repeat(edit.deleted) { control.pressKey("Backspace") }
+                if (edit.inserted.isNotEmpty()) control.pasteText(edit.inserted)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                state = ControlState.Failed(error.message ?: "键盘输入发送失败")
+            }
+        }
     }
 
     LaunchedEffect(baseUrl, surface, pcmPlayer, connectionGeneration) {
@@ -130,7 +187,9 @@ fun ControlScreen(
                 focusRequester.requestFocus()
                 coroutineScope {
                     launch {
-                        VideoPipeline(session, targetSurface).run()
+                        VideoPipeline(session, targetSurface) { width, height ->
+                            videoSize = width to height
+                        }.run()
                     }
                     launch(Dispatchers.IO) {
                         try {
@@ -197,52 +256,59 @@ fun ControlScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black),
+            .background(Color.Black)
+            // 挂在外层而不是画面上：软键盘那个隐藏输入框获得焦点时，外接键盘的按键
+            // 也要先被这里截走，否则会被当成文字输入、丢掉 Ctrl 之类的组合键
+            .onPreviewKeyEvent { event ->
+                val key = event.nativeKeyEvent.toCh9329Key() ?: return@onPreviewKeyEvent false
+                runCatching {
+                    when (event.nativeKeyEvent.action) {
+                        AndroidKeyEvent.ACTION_DOWN -> serialControl?.keydown(key)
+                        AndroidKeyEvent.ACTION_UP -> serialControl?.keyup(key)
+                    }
+                }.onFailure { state = ControlState.Failed(it.message ?: "键盘输入发送失败") }
+                true
+            },
         contentAlignment = Alignment.Center,
     ) {
         val currentConfig = config
         val useAbsoluteMouse = absoluteMouse ?: (currentConfig?.serial?.mouseMode != "relative")
+        // 画面区域按实际画面比例布局，而不是铺满后再留黑边：H.264 由 MediaCodec 直接
+        // 铺满 Surface、不保持比例，铺满的话画面被拉伸，触摸坐标也就对不上了
+        val (videoWidth, videoHeight) = videoSize
+            ?: currentConfig?.let { it.video.width to it.video.height }
+            ?: (DEFAULT_VIDEO_WIDTH to DEFAULT_VIDEO_HEIGHT)
         VideoSurface(
             modifier = Modifier
-                .fillMaxSize()
+                .aspectRatio(videoWidth.toFloat() / videoHeight)
                 .focusRequester(focusRequester)
-                .onPreviewKeyEvent { event ->
-                    val key = event.nativeKeyEvent.toCh9329Key() ?: return@onPreviewKeyEvent false
-                    runCatching {
-                        when (event.nativeKeyEvent.action) {
-                            AndroidKeyEvent.ACTION_DOWN -> serialControl?.keydown(key)
-                            AndroidKeyEvent.ACTION_UP -> serialControl?.keyup(key)
-                        }
-                    }.onFailure { state = ControlState.Failed(it.message ?: "键盘输入发送失败") }
-                    true
-                }
                 .focusable()
-                .then(
-                    if (currentConfig == null) {
-                        Modifier
-                    } else {
-                        Modifier.ch9329TouchInput(
-                            videoWidth = currentConfig.video.width,
-                            videoHeight = currentConfig.video.height,
-                            absoluteMouse = useAbsoluteMouse,
-                            onAbsolute = { x, y, buttons ->
-                                runCatching {
-                                    serialControl?.mouseMoveAbsolute(x, y, buttons)
-                                }.onFailure {
-                                    state = ControlState.Failed(it.message ?: "触摸输入发送失败")
-                                }
-                            },
-                            onRelative = { dx, dy, buttons ->
-                                runCatching {
-                                    serialControl?.mouseMoveRelative(dx, dy, buttons)
-                                }.onFailure {
-                                    state = ControlState.Failed(it.message ?: "触摸输入发送失败")
-                                }
-                            },
-                        )
-                    },
+                .ch9329TouchInput(
+                    videoWidth = videoWidth,
+                    videoHeight = videoHeight,
+                    absoluteMouse = useAbsoluteMouse,
+                    sink = pointerSink,
                 ),
             onSurface = { surface = it },
+        )
+        BasicTextField(
+            value = keyboardField,
+            onValueChange = { next ->
+                val edit = diffKeyboardInput(next.text, keyboardSentinel)
+                if (!edit.isEmpty) keyboardEdits.trySend(edit)
+                keyboardSentinel = nextKeyboardSentinel(keyboardSentinel)
+                keyboardField = TextFieldValue(keyboardSentinel, TextRange(keyboardSentinel.length))
+            },
+            // 密码类型让输入法不做联想、自动更正和拼写组合，否则提交的文字会被反复改写
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                autoCorrectEnabled = false,
+            ),
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .size(1.dp)
+                .alpha(0f)
+                .focusRequester(keyboardFocus),
         )
         when (val current = state) {
             ControlState.Connecting -> CircularProgressIndicator()
@@ -266,6 +332,12 @@ fun ControlScreen(
                 muted = muted,
                 onMutedChange = { muted = it },
             )
+            TextButton(onClick = {
+                runCatching { keyboardFocus.requestFocus() }
+                keyboardController?.show()
+            }) {
+                Text("键盘")
+            }
             TextButton(onClick = {
                 runCatching { serialControl?.releaseAllKeys() }
                     .onFailure { state = ControlState.Failed(it.message ?: "按键释放失败") }
@@ -446,6 +518,9 @@ private fun AndroidKeyEvent.toCh9329Key(): String? = when (keyCode) {
     AndroidKeyEvent.KEYCODE_APOSTROPHE -> "Quote"
     else -> null
 }
+
+private const val DEFAULT_VIDEO_WIDTH = 1920
+private const val DEFAULT_VIDEO_HEIGHT = 1080
 
 private sealed interface ControlState {
     data object Connecting : ControlState

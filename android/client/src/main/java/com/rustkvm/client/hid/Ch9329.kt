@@ -16,6 +16,8 @@ class Ch9329(
     private val pressedKeys = mutableListOf<Int>()
     private val pressedModifiers = mutableSetOf<String>()
     private var mouseButtons = 0
+    private var lastAbsoluteX = 0
+    private var lastAbsoluteY = 0
 
     fun keydown(key: String) {
         val modifier = Ch9329Maps.CONTROL_KEY_BITS[key]
@@ -51,38 +53,54 @@ class Ch9329(
     }
 
     fun mouseMoveAbsolute(nx: Float, ny: Float, buttons: Int) {
-        val x = absoluteCoordinate(nx)
-        val y = absoluteCoordinate(ny)
-        mouseWriter(buttons)(
-            packet(
-                command = COMMAND_MOUSE_ABSOLUTE,
-                data = intArrayOf(
-                    0x02,
-                    buttons and 0xFF,
-                    x and 0xFF,
-                    (x ushr 8) and 0xFF,
-                    y and 0xFF,
-                    (y ushr 8) and 0xFF,
-                    0x00,
-                ),
-            ),
-        )
+        lastAbsoluteX = absoluteCoordinate(nx)
+        lastAbsoluteY = absoluteCoordinate(ny)
+        mouseWriter(buttons)(absolutePacket(buttons, wheel = 0))
     }
 
     fun mouseMoveRelative(dx: Int, dy: Int, buttons: Int) {
-        mouseWriter(buttons)(
-            packet(
-                command = COMMAND_MOUSE_RELATIVE,
-                data = intArrayOf(
-                    0x01,
-                    buttons and 0xFF,
-                    dx.coerceIn(-127, 127) and 0xFF,
-                    dy.coerceIn(-127, 127) and 0xFF,
-                    0x00,
-                ),
-            ),
+        mouseWriter(buttons)(relativePacket(buttons, dx, dy, wheel = 0))
+    }
+
+    /**
+     * 正数向上滚。绝对模式的滚轮包也带坐标，沿用最后一次的位置，否则光标会跳到左上角。
+     * 每一格都是独立事件，走不可合并的命令队列。
+     */
+    fun mouseScroll(notches: Int) {
+        if (notches == 0) return
+        val wheel = notches.coerceIn(-127, 127)
+        write(
+            if (absoluteMouse) {
+                absolutePacket(mouseButtons, wheel)
+            } else {
+                relativePacket(mouseButtons, 0, 0, wheel)
+            },
         )
     }
+
+    private fun absolutePacket(buttons: Int, wheel: Int): ByteArray = packet(
+        command = COMMAND_MOUSE_ABSOLUTE,
+        data = intArrayOf(
+            0x02,
+            buttons and 0xFF,
+            lastAbsoluteX and 0xFF,
+            (lastAbsoluteX ushr 8) and 0xFF,
+            lastAbsoluteY and 0xFF,
+            (lastAbsoluteY ushr 8) and 0xFF,
+            wheel and 0xFF,
+        ),
+    )
+
+    private fun relativePacket(buttons: Int, dx: Int, dy: Int, wheel: Int): ByteArray = packet(
+        command = COMMAND_MOUSE_RELATIVE,
+        data = intArrayOf(
+            0x01,
+            buttons and 0xFF,
+            dx.coerceIn(-127, 127) and 0xFF,
+            dy.coerceIn(-127, 127) and 0xFF,
+            wheel and 0xFF,
+        ),
+    )
 
     fun ctrlAltDelete() {
         write(

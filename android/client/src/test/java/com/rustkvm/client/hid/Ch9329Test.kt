@@ -19,6 +19,34 @@ class Ch9329Test {
     }
 
     @Test
+    fun absoluteScrollKeepsLastPosition() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(absoluteMouse = true) { frames += it }
+
+        ch.mouseMoveAbsolute(1f, 0f, 0)
+        ch.mouseScroll(1)
+
+        assertArrayEquals(
+            bytes(0x57, 0xAB, 0x00, 0x04, 0x07, 0x02, 0x00, 0xFF, 0x0F, 0x00, 0x00, 0x01, 0x1E),
+            frames.last(),
+        )
+    }
+
+    @Test
+    fun relativeScrollEncodesSignedWheel() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(absoluteMouse = false) { frames += it }
+
+        ch.mouseScroll(-1)
+        ch.mouseScroll(0)
+
+        assertArrayEquals(
+            bytes(0x57, 0xAB, 0x00, 0x05, 0x05, 0x01, 0x00, 0x00, 0x00, 0xFF, 0x0C),
+            frames.single(),
+        )
+    }
+
+    @Test
     fun absoluteCoordsOutsideRangeAreClamped() {
         val frames = mutableListOf<ByteArray>()
         val ch = Ch9329(absoluteMouse = true) { frames += it }
