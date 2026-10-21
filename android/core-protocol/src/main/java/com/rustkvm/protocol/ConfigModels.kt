@@ -76,3 +76,5 @@ private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 fun parseConfig(text: String): KvmConfig = json.decodeFromString(text)
 fun encodeConfig(config: KvmConfig): String = json.encodeToString(config)
 fun parseDevices(text: String): KvmDevices = json.decodeFromString(text)
+fun encodeDevices(devices: KvmDevices): String = json.encodeToString(devices)
+fun encodeSerialDevices(devices: List<SerialDevice>): String = json.encodeToString(devices)
