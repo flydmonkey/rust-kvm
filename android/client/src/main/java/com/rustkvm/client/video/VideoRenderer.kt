@@ -2,17 +2,16 @@ package com.rustkvm.client.video
 
 import android.graphics.Color
 import android.graphics.Rect
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import com.rustkvm.client.net.KvmSession
+import com.rustkvm.client.net.StreamMessage
+import com.rustkvm.client.net.receiveBatch
 import com.rustkvm.protocol.VideoText
 import com.rustkvm.protocol.parseVideoText
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 class VideoPipeline(
@@ -20,56 +19,65 @@ class VideoPipeline(
     private val surface: Surface,
 ) {
     suspend fun run() = withContext(Dispatchers.Default) {
-        val stateLock = Mutex()
-        var selection: CodecSelection? = null
+        var codec: String? = null
         var h264Decoder: H264Decoder? = null
+        var lastReopenAt = 0L
+
+        suspend fun reopenVideo(reason: String) {
+            Log.w(TAG, "Reopening video stream: $reason")
+            h264Decoder?.close()
+            h264Decoder = null
+            codec = null
+            // 解码器若是每个 IDR 都失败（比如机型不支持该 profile），别以满速反复重连
+            val sinceLast = SystemClock.elapsedRealtime() - lastReopenAt
+            if (sinceLast < MIN_REOPEN_INTERVAL_MS) delay(MIN_REOPEN_INTERVAL_MS - sinceLast)
+            lastReopenAt = SystemClock.elapsedRealtime()
+            session.reopenVideo()
+        }
+
         try {
-            coroutineScope {
-                launch {
-                    session.videoText.collect { text ->
-                        when (val message = parseVideoText(text)) {
+            while (true) {
+                val batch = session.videoMessages.receiveBatch() ?: return@withContext
+                val frames = batch.count { it is StreamMessage.Binary }
+                // H.264 积压了就不能靠丢帧追上（会花屏），只能整段丢掉、从新的 IDR 重来
+                if (codec == H264_CODEC && frames > MAX_H264_BACKLOG) {
+                    reopenVideo("H.264 backlog of $frames frames")
+                    continue
+                }
+                // MJPEG 每帧独立：一批里只画最新的一帧，跟不上就丢旧帧，延迟不会越积越大
+                var latestJpeg: ByteArray? = null
+                batch@ for (message in batch) {
+                    when (message) {
+                        is StreamMessage.Text -> when (val parsed = parseVideoText(message.text)) {
+                            // 每条编码头都重建解码器：服务端改分辨率时也只是重发头加 IDR，
+                            // avcCodec 可能不变，沿用旧解码器在部分机型上换不了尺寸
                             is VideoText.Codec -> {
-                                val next = CodecSelection(
-                                    codec = message.codec.lowercase(),
-                                    avcCodec = message.avcCodec,
-                                )
-                                var previousDecoder: H264Decoder? = null
-                                stateLock.withLock {
-                                    if (next != selection) {
-                                        previousDecoder = h264Decoder
-                                        h264Decoder = if (
-                                            next.codec == H264_CODEC &&
-                                            next.avcCodec != null
-                                        ) {
-                                            H264Decoder(surface)
-                                        } else {
-                                            null
-                                        }
-                                        selection = next
-                                    }
+                                latestJpeg = null
+                                h264Decoder?.close()
+                                codec = parsed.codec.lowercase()
+                                h264Decoder = if (codec == H264_CODEC && parsed.avcCodec != null) {
+                                    H264Decoder(surface)
+                                } else {
+                                    null
                                 }
-                                previousDecoder?.close()
                             }
 
                             is VideoText.Idle, VideoText.Unknown -> Unit
                         }
+
+                        is StreamMessage.Binary -> when (codec) {
+                            MJPEG_CODEC -> latestJpeg = message.data
+                            H264_CODEC -> if (h264Decoder?.queue(message.data) == false) {
+                                reopenVideo("H.264 decoder failed")
+                                break@batch
+                            }
+                        }
                     }
                 }
-                session.videoBinary.collect { bytes ->
-                    val (codec, decoder) = stateLock.withLock {
-                        selection?.codec to h264Decoder
-                    }
-                    when (codec) {
-                        MJPEG_CODEC -> render(bytes)
-                        H264_CODEC -> decoder?.queue(bytes)
-                    }
-                }
+                latestJpeg?.let(::render)
             }
         } finally {
-            val decoder = stateLock.withLock {
-                h264Decoder.also { h264Decoder = null }
-            }
-            decoder?.close()
+            h264Decoder?.close()
         }
     }
 
@@ -125,10 +133,7 @@ class VideoPipeline(
         const val TAG = "VideoPipeline"
         const val MJPEG_CODEC = "mjpeg"
         const val H264_CODEC = "h264"
+        const val MAX_H264_BACKLOG = 15
+        const val MIN_REOPEN_INTERVAL_MS = 1_000L
     }
-
-    private data class CodecSelection(
-        val codec: String,
-        val avcCodec: String?,
-    )
 }

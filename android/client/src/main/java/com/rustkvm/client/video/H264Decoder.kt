@@ -16,17 +16,23 @@ class H264Decoder(
     private var closed = false
     private var missingParameterSetsWarned = false
 
+    /**
+     * 返回 false 表示解码器已出错并重置，后续帧在下一个 IDR 之前都画不出来；
+     * 调用方应当重连画面让服务端立刻补一个 IDR，而不是干等 10 秒的 GOP。
+     */
     @Synchronized
-    fun queue(accessUnit: ByteArray) {
-        if (closed) return
+    fun queue(accessUnit: ByteArray): Boolean {
+        if (closed) return true
         val nals = AnnexBNalScanner.scan(accessUnit)
         rememberParameterSets(accessUnit, nals)
 
-        try {
+        return try {
             queueToCodec(accessUnit, nals)
+            true
         } catch (error: Exception) {
             Log.w(TAG, "Dropping H.264 access unit after MediaCodec failure", error)
             resetCodec()
+            false
         }
     }
 
@@ -50,9 +56,16 @@ class H264Decoder(
             codec = currentCodec
         }
 
-        drainOutput(currentCodec)
-        val inputIndex = currentCodec.dequeueInputBuffer(INPUT_TIMEOUT_US)
-        if (inputIndex < 0) return
+        // H.264 不能丢帧：丢一个 P 帧，后面直到下一个 IDR 全是花屏。所以拿不到输入
+        // 缓冲就边取输出边等，等太久才当作解码器卡死，交给上层重连。
+        val deadline = System.nanoTime() + INPUT_WAIT_LIMIT_NS
+        var inputIndex: Int
+        while (true) {
+            drainOutput(currentCodec)
+            inputIndex = currentCodec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            if (inputIndex >= 0) break
+            check(System.nanoTime() < deadline) { "MediaCodec input buffer unavailable" }
+        }
         val input = requireNotNull(currentCodec.getInputBuffer(inputIndex)) {
             "MediaCodec returned no input buffer"
         }
@@ -140,6 +153,7 @@ class H264Decoder(
         const val DEFAULT_WIDTH = 1920
         const val DEFAULT_HEIGHT = 1080
         const val INPUT_TIMEOUT_US = 10_000L
+        const val INPUT_WAIT_LIMIT_NS = 1_000_000_000L
         const val NO_WAIT = 0L
         const val NANOS_PER_MICROSECOND = 1_000L
         const val TAG = "H264Decoder"

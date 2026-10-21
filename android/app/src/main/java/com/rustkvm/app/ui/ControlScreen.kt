@@ -39,6 +39,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.rustkvm.app.ui.input.ch9329TouchInput
 import com.rustkvm.app.ui.components.AudioToggle
 import com.rustkvm.client.audio.PcmPlayer
+import com.rustkvm.client.audio.trimAudioBacklog
 import com.rustkvm.client.hid.ControlBusy
 import com.rustkvm.client.hid.SerialControl
 import com.rustkvm.client.hid.SerialControlFailure
@@ -46,6 +47,8 @@ import com.rustkvm.client.net.CertDecision
 import com.rustkvm.client.net.KvmHttpClient
 import com.rustkvm.client.net.KvmSession
 import com.rustkvm.client.net.ReconnectPolicy
+import com.rustkvm.client.net.StreamMessage
+import com.rustkvm.client.net.receiveBatch
 import com.rustkvm.client.video.VideoPipeline
 import com.rustkvm.protocol.CertTrustStore
 import com.rustkvm.protocol.KvmConfig
@@ -129,26 +132,26 @@ fun ControlScreen(
                     launch {
                         VideoPipeline(session, targetSurface).run()
                     }
-                    launch {
-                        try {
-                            session.audioText.collect { text ->
-                                val header = parseAudioText(text)
-                                if (header != null) {
-                                    pcmPlayer.onFormat(header)
-                                    audioError = null
-                                } else {
-                                    parseAudioError(text)?.let { audioError = it }
-                                }
-                            }
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (error: Exception) {
-                            audioError = error.message ?: "音频播放不可用"
-                        }
-                    }
                     launch(Dispatchers.IO) {
                         try {
-                            session.audioBinary.collect(pcmPlayer::write)
+                            while (true) {
+                                val batch = session.audioMessages.receiveBatch() ?: break
+                                for (message in trimAudioBacklog(batch)) {
+                                    when (message) {
+                                        is StreamMessage.Text -> {
+                                            val header = parseAudioText(message.text)
+                                            if (header != null) {
+                                                pcmPlayer.onFormat(header)
+                                                audioError = null
+                                            } else {
+                                                parseAudioError(message.text)?.let { audioError = it }
+                                            }
+                                        }
+
+                                        is StreamMessage.Binary -> pcmPlayer.write(message.data)
+                                    }
+                                }
+                            }
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (error: Exception) {

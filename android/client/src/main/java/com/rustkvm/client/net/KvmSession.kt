@@ -8,6 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -26,30 +27,18 @@ class KvmSession(
     private val httpClient: KvmHttpClient,
     private val takeoverSerial: Boolean = false,
 ) : Closeable, SerialConnection {
-    private val videoTextChannel = kotlinx.coroutines.channels.Channel<String>(
-        kotlinx.coroutines.channels.Channel.UNLIMITED,
-    )
-    private val videoBinaryChannel = kotlinx.coroutines.channels.Channel<ByteArray>(
-        kotlinx.coroutines.channels.Channel.UNLIMITED,
-    )
-    private val audioTextChannel = kotlinx.coroutines.channels.Channel<String>(
-        kotlinx.coroutines.channels.Channel.UNLIMITED,
-    )
-    private val audioBinaryChannel = kotlinx.coroutines.channels.Channel<ByteArray>(
-        kotlinx.coroutines.channels.Channel.UNLIMITED,
-    )
-    private val serialTextChannel = kotlinx.coroutines.channels.Channel<String>(
-        kotlinx.coroutines.channels.Channel.UNLIMITED,
-    )
+    // 视频和音频不在这里限容：H.264 一帧都不能悄悄丢，丢哪些只有消费方按编码判断得了，
+    // 所以消费方用 receiveBatch 一次取走全部积压再决定。
+    private val videoChannel = Channel<StreamMessage>(Channel.UNLIMITED)
+    private val audioChannel = Channel<StreamMessage>(Channel.UNLIMITED)
+    private val serialTextChannel = Channel<String>(Channel.UNLIMITED)
     private val serialBinaryChannel = Channel<ByteArray>(
         capacity = SERIAL_BINARY_CAPACITY,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
-    val videoText: Flow<String> = videoTextChannel.receiveAsFlow()
-    val videoBinary: Flow<ByteArray> = videoBinaryChannel.receiveAsFlow()
-    val audioText: Flow<String> = audioTextChannel.receiveAsFlow()
-    val audioBinary: Flow<ByteArray> = audioBinaryChannel.receiveAsFlow()
+    val videoMessages: ReceiveChannel<StreamMessage> = videoChannel
+    val audioMessages: ReceiveChannel<StreamMessage> = audioChannel
     override val serialText: Flow<String> = serialTextChannel.receiveAsFlow()
     override val serialBinary: Flow<ByteArray> = serialBinaryChannel.receiveAsFlow()
 
@@ -83,6 +72,27 @@ class KvmSession(
 
     override fun sendSerialBinary(data: ByteArray): Boolean =
         synchronized(stateLock) { sockets[SocketKind.SERIAL] }?.send(data.toByteString()) ?: false
+
+    /**
+     * 只重连画面这一路。服务端把重连当作新观看者，会立刻强制一个 IDR；否则 H.264
+     * 解码器出错或积压后要等下一个自然 IDR，GOP 是 10 秒。键鼠和声音不受影响。
+     *
+     * 调用方必须是 [videoMessages] 的唯一消费者：旧连接留在队列里的消息在这里清掉。
+     */
+    suspend fun reopenVideo() {
+        val old = synchronized(stateLock) {
+            check(!closed) { "Session is closed" }
+            sockets.remove(SocketKind.VIDEO)
+        }
+        old?.cancel()
+        while (videoChannel.tryReceive().isSuccess) Unit
+        try {
+            openWebSocket(SocketKind.VIDEO)
+        } catch (error: Throwable) {
+            terminate(error)
+            throw error
+        }
+    }
 
     suspend fun awaitDisconnect(): Throwable? = termination.await()
 
@@ -150,24 +160,29 @@ class KvmSession(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            // reopenVideo 之后旧连接可能还在吐消息，混进来会让新解码器先吃到旧码流
+            if (!isCurrentSocket(kind, webSocket)) return
             when (kind) {
-                SocketKind.VIDEO -> videoTextChannel.trySend(text)
-                SocketKind.AUDIO -> audioTextChannel.trySend(text)
+                SocketKind.VIDEO -> videoChannel.trySend(StreamMessage.Text(text))
+                SocketKind.AUDIO -> audioChannel.trySend(StreamMessage.Text(text))
                 SocketKind.SERIAL -> serialTextChannel.trySend(text)
             }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (!isCurrentSocket(kind, webSocket)) return
             val data = bytes.toByteArray()
             when (kind) {
-                SocketKind.VIDEO -> videoBinaryChannel.trySend(data)
-                SocketKind.AUDIO -> audioBinaryChannel.trySend(data)
+                SocketKind.VIDEO -> videoChannel.trySend(StreamMessage.Binary(data))
+                SocketKind.AUDIO -> audioChannel.trySend(StreamMessage.Binary(data))
                 SocketKind.SERIAL -> serialBinaryChannel.trySend(data)
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (!opened.completeExceptionally(t)) {
+                // 被 reopenVideo 换下的旧连接 cancel 后也会走到这里，不能连带拆掉整个会话
+                if (!isCurrentSocket(kind, webSocket)) return
                 if (kind == SocketKind.AUDIO) {
                     terminateAudio(webSocket, t)
                 } else {
@@ -208,8 +223,7 @@ class KvmSession(
             }
         }
         if (!removed) return
-        audioTextChannel.close(error)
-        audioBinaryChannel.close(error)
+        audioChannel.close(error)
     }
 
     private fun markClosed(): List<WebSocket> = synchronized(stateLock) {
@@ -221,10 +235,8 @@ class KvmSession(
     }
 
     private fun closeChannels(error: Throwable? = null) {
-        videoTextChannel.close(error)
-        videoBinaryChannel.close(error)
-        audioTextChannel.close(error)
-        audioBinaryChannel.close(error)
+        videoChannel.close(error)
+        audioChannel.close(error)
         serialTextChannel.close(error)
         serialBinaryChannel.close(error)
     }
