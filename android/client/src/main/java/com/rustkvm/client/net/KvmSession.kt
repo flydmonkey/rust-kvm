@@ -191,6 +191,12 @@ class KvmSession(
             }
         }
 
+        // OkHttp 收到对端的关闭帧后要我们回一个，onClosed 才会来；不回的话服务端正常
+        // 关掉连接（重启、关音频）时会话察觉不到，画面就停在最后一帧
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            webSocket.close(NORMAL_CLOSE_CODE, null)
+        }
+
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (isCurrentSocket(kind, webSocket)) {
                 val error = IOException("${kind.name.lowercase()} WebSocket closed: $code $reason")
