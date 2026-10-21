@@ -3,10 +3,12 @@ package com.rustkvm.app.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.os.SystemClock
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
@@ -170,6 +172,31 @@ fun ControlScreen(
         }
     }
 
+    // 直接离开页面：连接循环随页面退出被取消，串口在它的 finally 里关闭。连接失败后循环
+    // 已经结束，不能指望它来调用 onDisconnect
+    fun disconnect() {
+        if (userDisconnected) return
+        userDisconnected = true
+        runCatching { serialControl?.releaseAllKeys() }
+        onDisconnect()
+    }
+
+    val backPress = remember(baseUrl) { DoubleBackPress() }
+    var backNotice by remember(baseUrl) { mutableStateOf<String?>(null) }
+    BackHandler {
+        if (backPress.press(SystemClock.uptimeMillis())) {
+            disconnect()
+        } else {
+            backNotice = "再按一次返回断开连接"
+        }
+    }
+    LaunchedEffect(backNotice) {
+        if (backNotice != null) {
+            delay(DoubleBackPress.DOUBLE_BACK_WINDOW_MS)
+            backNotice = null
+        }
+    }
+
     // 软键盘和功能键栏的按键必须按顺序逐个敲完：并发敲的话按键会交错
     LaunchedEffect(keyInputs) {
         for (input in keyInputs) {
@@ -306,9 +333,6 @@ fun ControlScreen(
                 control?.close()
             }
         }
-        if (userDisconnected) {
-            onDisconnect()
-        }
     }
 
     Box(
@@ -431,11 +455,7 @@ fun ControlScreen(
             }) {
                 Text(if (useAbsoluteMouse) "鼠标：绝对" else "鼠标：相对")
             }
-            TextButton(onClick = {
-                userDisconnected = true
-                runCatching { serialControl?.releaseAllKeys() }
-                serialControl?.close()
-            }) {
+            TextButton(onClick = ::disconnect) {
                 Text("断开")
             }
             TextButton(onClick = onOpenSettings) {
@@ -446,6 +466,16 @@ fun ControlScreen(
             modifier = Modifier.align(Alignment.BottomCenter),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            backNotice?.let { message ->
+                Text(
+                    text = message,
+                    color = Color.White,
+                    modifier = Modifier
+                        .padding(8.dp)
+                        .background(Color.Black.copy(alpha = 0.7f))
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+            }
             listOfNotNull(videoNotice, audioError?.let { "音频不可用：$it" }).forEach { message ->
                 Text(
                     text = message,

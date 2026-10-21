@@ -65,13 +65,13 @@ fun ConnectScreen(
             }
         }
 
-    fun connect() {
+    fun connect(target: String = address) {
         if (connecting) return
         scope.launch {
             connecting = true
             errorMessage = null
             try {
-                val normalizedUrl = normalizeServerUrl(address).toString()
+                val normalizedUrl = normalizeServerUrl(target).toString()
                 KvmHttpClient(
                     baseUrl = normalizedUrl,
                     trustStore = trustStore,
@@ -115,7 +115,7 @@ fun ConnectScreen(
             },
         )
         Button(
-            onClick = ::connect,
+            onClick = { connect() },
             enabled = address.isNotBlank() && !connecting,
             modifier = Modifier.fillMaxWidth(),
         ) {
@@ -141,7 +141,7 @@ fun ConnectScreen(
                         .fillMaxWidth()
                         .clickable(enabled = !connecting) {
                             address = server
-                            errorMessage = null
+                            connect(server)
                         }
                         .padding(vertical = 12.dp),
                     style = MaterialTheme.typography.bodyLarge,

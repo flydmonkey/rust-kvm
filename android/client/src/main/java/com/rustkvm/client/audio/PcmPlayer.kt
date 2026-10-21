@@ -22,8 +22,23 @@ class PcmPlayer : Closeable {
     private val lock = Any()
     private var track: AudioTrack? = null
 
+    /** 静音时暂停并清空 AudioTrack，否则已缓冲的声音会继续播完，取消静音时还会先放一段旧的。 */
     @Volatile
     var muted: Boolean = false
+        set(value) {
+            synchronized(lock) {
+                if (field == value) return
+                field = value
+                track?.let { current ->
+                    if (value) {
+                        current.pause()
+                        current.flush()
+                    } else {
+                        current.play()
+                    }
+                }
+            }
+        }
 
     fun onFormat(header: AudioFormatHeader) {
         require(header.format.equals("s16le", ignoreCase = true)) {
@@ -62,13 +77,13 @@ class PcmPlayer : Closeable {
             .setBufferSizeInBytes(bufferSize)
             .build()
         check(next.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack 初始化失败" }
-        try {
-            next.play()
-        } catch (error: Exception) {
-            next.release()
-            throw error
-        }
         synchronized(lock) {
+            try {
+                if (!muted) next.play()
+            } catch (error: Exception) {
+                next.release()
+                throw error
+            }
             track?.release()
             track = next
         }

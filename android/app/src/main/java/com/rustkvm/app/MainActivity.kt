@@ -43,7 +43,9 @@ class MainActivity : ComponentActivity() {
                                     trustStore = trustStore,
                                     recentServersStore = recentServersStore,
                                     onConnected = { baseUrl ->
-                                        navController.navigate("control/${Uri.encode(baseUrl)}")
+                                        navController.navigate("control/${Uri.encode(baseUrl)}") {
+                                            launchSingleTop = true
+                                        }
                                     },
                                 )
                             }
@@ -62,7 +64,9 @@ class MainActivity : ComponentActivity() {
                                 trustStore = trustStore,
                                 onDisconnect = { navController.popBackStack() },
                                 onOpenSettings = {
-                                    navController.navigate("settings/${Uri.encode(baseUrl)}")
+                                    navController.navigate("settings/${Uri.encode(baseUrl)}") {
+                                        launchSingleTop = true
+                                    }
                                 },
                             )
                         }
