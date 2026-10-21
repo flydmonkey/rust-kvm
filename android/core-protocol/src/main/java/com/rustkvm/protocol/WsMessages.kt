@@ -8,7 +8,12 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 
 sealed class VideoText {
-    data class Codec(val codec: String, val avcCodec: String?) : VideoText()
+    /** [fallbackReason] 非空表示配置要 H.264 但编码器起不来，服务端退回了 MJPEG。 */
+    data class Codec(
+        val codec: String,
+        val avcCodec: String?,
+        val fallbackReason: String? = null,
+    ) : VideoText()
     data class Idle(val skipped: Long?) : VideoText()
     data object Unknown : VideoText()
 }
@@ -37,6 +42,7 @@ fun parseVideoText(text: String): VideoText {
         "codec" -> VideoText.Codec(
             codec = obj["codec"]?.jsonPrimitive?.contentOrNull ?: return VideoText.Unknown,
             avcCodec = obj["avcCodec"]?.jsonPrimitive?.contentOrNull,
+            fallbackReason = obj["fallbackReason"]?.jsonPrimitive?.contentOrNull,
         )
         "idle" -> VideoText.Idle(
             skipped = obj["skipped"]?.jsonPrimitive?.longOrNull,

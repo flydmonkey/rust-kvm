@@ -10,6 +10,15 @@ class WsMessagesTest {
         val c = v as VideoText.Codec
         assertEquals("h264", c.codec)
         assertEquals("avc1.4D0428", c.avcCodec)
+        assertEquals(null, c.fallbackReason)
+    }
+
+    @Test
+    fun parsesMjpegFallbackReason() {
+        val v = parseVideoText("""{"op":"codec","codec":"mjpeg","fallbackReason":"编码器没能在 5 秒内就绪"}""")
+        val c = v as VideoText.Codec
+        assertEquals("mjpeg", c.codec)
+        assertEquals("编码器没能在 5 秒内就绪", c.fallbackReason)
     }
 
     @Test

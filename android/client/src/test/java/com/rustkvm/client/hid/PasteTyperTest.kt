@@ -24,4 +24,18 @@ class PasteTyperTest {
         assertEquals(0x28, frames[6][7].toInt())
         assertEquals(List(8) { PasteTyper.PACKET_GAP_MS }, waits)
     }
+
+    @Test
+    fun modifierBitsCombineWithShiftAndAreReleasedAfterEachCharacter() = runBlocking {
+        val frames = mutableListOf<ByteArray>()
+        val typer = PasteTyper(
+            ch9329 = Ch9329(absoluteMouse = true) { frames += it },
+            wait = {},
+        )
+
+        typer.typeText("cC", modifierBits = 0x01)
+
+        assertEquals(listOf(0x01, 0x00, 0x03, 0x00), frames.map { it[5].toInt() })
+        assertEquals(listOf(0x06, 0x00, 0x06, 0x00), frames.map { it[7].toInt() })
+    }
 }

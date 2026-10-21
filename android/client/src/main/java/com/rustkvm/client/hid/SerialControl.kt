@@ -133,11 +133,11 @@ class SerialControl<S : SerialConnection>(
 
     fun mouseScroll(notches: Int) = requireHid().mouseScroll(notches)
 
-    fun pressKey(key: String) {
-        val hid = requireHid()
-        hid.keydown(key)
-        hid.keyup(key)
-    }
+    fun tapKey(key: String, modifiers: Set<String> = emptySet()) = requireHid().tap(key, modifiers)
+
+    suspend fun typeText(text: String, modifiers: Set<String>): PasteResult =
+        checkNotNull(pasteTyper) { "Serial control is not open" }
+            .typeText(text, Ch9329.modifierBits(modifiers))
 
     fun setAbsoluteMouse(absolute: Boolean) {
         absoluteMouseOverride = absolute

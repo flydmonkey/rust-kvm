@@ -11,7 +11,8 @@ class PasteTyper(
     private val ch9329: Ch9329,
     private val wait: suspend (Long) -> Unit = { delay(it) },
 ) {
-    suspend fun typeText(text: String): PasteResult {
+    /** [modifierBits] 加在每个字符上，用于软键盘配合粘滞的 Ctrl / Alt 打出组合键。 */
+    suspend fun typeText(text: String, modifierBits: Int = 0): PasteResult {
         var typed = 0
         var skipped = 0
         text.forEach { character ->
@@ -19,7 +20,8 @@ class PasteTyper(
             if (key == null) {
                 skipped += 1
             } else {
-                ch9329.pressUsage(key.code, key.shifted)
+                val shift = if (key.shifted) Ch9329.LEFT_SHIFT else 0
+                ch9329.pressUsage(key.code, modifierBits or shift)
                 wait(PACKET_GAP_MS)
                 ch9329.releaseAllKeys()
                 wait(PACKET_GAP_MS)

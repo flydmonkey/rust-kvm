@@ -1,5 +1,8 @@
 package com.rustkvm.app.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -7,7 +10,13 @@ import android.view.SurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
@@ -40,11 +49,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.rustkvm.app.ui.components.ExtraKeysBar
 import com.rustkvm.app.ui.input.KEYBOARD_SENTINEL
 import com.rustkvm.app.ui.input.KeyboardEdit
 import com.rustkvm.app.ui.input.NormalizedTouch
@@ -52,6 +66,7 @@ import com.rustkvm.app.ui.input.PointerSink
 import com.rustkvm.app.ui.input.ch9329TouchInput
 import com.rustkvm.app.ui.input.diffKeyboardInput
 import com.rustkvm.app.ui.input.nextKeyboardSentinel
+import com.rustkvm.app.ui.input.onModifierTap
 import com.rustkvm.app.ui.components.AudioToggle
 import com.rustkvm.client.audio.PcmPlayer
 import com.rustkvm.client.audio.trimAudioBacklog
@@ -78,6 +93,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.IOException
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ControlScreen(
     baseUrl: String,
@@ -105,12 +121,35 @@ fun ControlScreen(
     var keyboardField by remember(baseUrl) {
         mutableStateOf(TextFieldValue(KEYBOARD_SENTINEL, TextRange(KEYBOARD_SENTINEL.length)))
     }
-    val keyboardEdits = remember(baseUrl) { Channel<KeyboardEdit>(Channel.UNLIMITED) }
+    val keyInputs = remember(baseUrl) { Channel<KeyInput>(Channel.UNLIMITED) }
+    var latchedModifiers by remember(baseUrl) { mutableStateOf(emptySet<String>()) }
+    var videoNotice by remember(baseUrl) { mutableStateOf<String?>(null) }
+    val imeVisible = WindowInsets.isImeVisible
     val clipboard = LocalClipboardManager.current
     val uiScope = rememberCoroutineScope()
     SideEffect { pcmPlayer.muted = muted }
     DisposableEffect(pcmPlayer) {
         onDispose { pcmPlayer.close() }
+    }
+
+    val view = LocalView.current
+    DisposableEffect(view) {
+        view.keepScreenOn = true
+        val insetsController = view.context.findActivity()?.window?.let { window ->
+            WindowCompat.getInsetsController(window, view)
+        }
+        insetsController?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose {
+            view.keepScreenOn = false
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    // 收起软键盘时把锁定的修饰键也松开，免得下次打字莫名带上 Ctrl
+    LaunchedEffect(imeVisible) {
+        if (!imeVisible) latchedModifiers = emptySet()
     }
 
     val pointerSink = remember(baseUrl) {
@@ -131,13 +170,27 @@ fun ControlScreen(
         }
     }
 
-    // 软键盘的编辑必须按顺序逐个敲完：并发敲的话两段文字的按键会交错
-    LaunchedEffect(keyboardEdits) {
-        for (edit in keyboardEdits) {
+    // 软键盘和功能键栏的按键必须按顺序逐个敲完：并发敲的话按键会交错
+    LaunchedEffect(keyInputs) {
+        for (input in keyInputs) {
             val control = serialControl ?: continue
             try {
-                repeat(edit.deleted) { control.pressKey("Backspace") }
-                if (edit.inserted.isNotEmpty()) control.pasteText(edit.inserted)
+                when (input) {
+                    is KeyInput.Tap -> control.tapKey(input.key, input.modifiers)
+                    is KeyInput.Typed -> {
+                        // 锁定的修饰键只作用于第一个键
+                        var modifiers = input.modifiers
+                        repeat(input.edit.deleted) {
+                            control.tapKey("Backspace", modifiers)
+                            modifiers = emptySet()
+                        }
+                        val inserted = input.edit.inserted
+                        if (inserted.isNotEmpty()) {
+                            control.typeText(inserted.take(1), modifiers)
+                            if (inserted.length > 1) control.typeText(inserted.drop(1), emptySet())
+                        }
+                    }
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -187,9 +240,14 @@ fun ControlScreen(
                 focusRequester.requestFocus()
                 coroutineScope {
                     launch {
-                        VideoPipeline(session, targetSurface) { width, height ->
-                            videoSize = width to height
-                        }.run()
+                        VideoPipeline(
+                            session = session,
+                            surface = targetSurface,
+                            onVideoSize = { width, height -> videoSize = width to height },
+                            onCodec = { _, fallbackReason ->
+                                videoNotice = fallbackReason?.let { "H.264 不可用，已退回 MJPEG：$it" }
+                            },
+                        ).run()
                     }
                     launch(Dispatchers.IO) {
                         try {
@@ -257,6 +315,8 @@ fun ControlScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .displayCutoutPadding()
+            .imePadding()
             // 挂在外层而不是画面上：软键盘那个隐藏输入框获得焦点时，外接键盘的按键
             // 也要先被这里截走，否则会被当成文字输入、丢掉 Ctrl 之类的组合键
             .onPreviewKeyEvent { event ->
@@ -295,7 +355,10 @@ fun ControlScreen(
             value = keyboardField,
             onValueChange = { next ->
                 val edit = diffKeyboardInput(next.text, keyboardSentinel)
-                if (!edit.isEmpty) keyboardEdits.trySend(edit)
+                if (!edit.isEmpty) {
+                    keyInputs.trySend(KeyInput.Typed(edit, latchedModifiers))
+                    latchedModifiers = emptySet()
+                }
                 keyboardSentinel = nextKeyboardSentinel(keyboardSentinel)
                 keyboardField = TextFieldValue(keyboardSentinel, TextRange(keyboardSentinel.length))
             },
@@ -379,14 +442,31 @@ fun ControlScreen(
                 Text("设置")
             }
         }
-        audioError?.let { message ->
-            Text(
-                text = "音频不可用：$message",
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(16.dp),
-            )
+        Column(
+            modifier = Modifier.align(Alignment.BottomCenter),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            listOfNotNull(videoNotice, audioError?.let { "音频不可用：$it" }).forEach { message ->
+                Text(
+                    text = message,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+            if (imeVisible) {
+                ExtraKeysBar(
+                    latchedModifiers = latchedModifiers,
+                    onModifier = { modifier ->
+                        val result = onModifierTap(latchedModifiers, modifier)
+                        latchedModifiers = result.latched
+                        result.sendKey?.let { keyInputs.trySend(KeyInput.Tap(it, result.sendModifiers)) }
+                    },
+                    onKey = { key ->
+                        keyInputs.trySend(KeyInput.Tap(key, latchedModifiers))
+                        latchedModifiers = emptySet()
+                    },
+                )
+            }
         }
     }
 
@@ -516,6 +596,17 @@ private fun AndroidKeyEvent.toCh9329Key(): String? = when (keyCode) {
     AndroidKeyEvent.KEYCODE_BACKSLASH -> "Backslash"
     AndroidKeyEvent.KEYCODE_RIGHT_BRACKET -> "BracketRight"
     AndroidKeyEvent.KEYCODE_APOSTROPHE -> "Quote"
+    else -> null
+}
+
+private sealed interface KeyInput {
+    data class Typed(val edit: KeyboardEdit, val modifiers: Set<String>) : KeyInput
+    data class Tap(val key: String, val modifiers: Set<String>) : KeyInput
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
     else -> null
 }
 

@@ -22,6 +22,7 @@ class VideoPipeline(
     private val session: KvmSession,
     private val surface: Surface,
     private val onVideoSize: (width: Int, height: Int) -> Unit = { _, _ -> },
+    private val onCodec: (codec: String, fallbackReason: String?) -> Unit = { _, _ -> },
 ) {
     private var reportedSize = 0 to 0
 
@@ -73,6 +74,7 @@ class VideoPipeline(
                                 } else {
                                     null
                                 }
+                                onCodec(codec ?: parsed.codec, parsed.fallbackReason)
                             }
 
                             is VideoText.Idle, VideoText.Unknown -> Unit

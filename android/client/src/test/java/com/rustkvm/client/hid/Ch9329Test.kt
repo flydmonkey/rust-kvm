@@ -19,6 +19,37 @@ class Ch9329Test {
     }
 
     @Test
+    fun tapSendsChordThenRestoresHeldKeys() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(absoluteMouse = true) { frames += it }
+
+        ch.tap("KeyC", setOf("ControlLeft"))
+
+        assertArrayEquals(
+            bytes(0x57, 0xAB, 0x00, 0x02, 0x08, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13),
+            frames[0],
+        )
+        assertArrayEquals(
+            bytes(0x57, 0xAB, 0x00, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C),
+            frames[1],
+        )
+        assertEquals(2, frames.size)
+    }
+
+    @Test
+    fun tappingAModifierAloneSendsOnlyItsBit() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(absoluteMouse = true) { frames += it }
+
+        ch.tap("MetaLeft")
+
+        assertArrayEquals(
+            bytes(0x57, 0xAB, 0x00, 0x02, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14),
+            frames[0],
+        )
+    }
+
+    @Test
     fun absoluteScrollKeepsLastPosition() {
         val frames = mutableListOf<ByteArray>()
         val ch = Ch9329(absoluteMouse = true) { frames += it }

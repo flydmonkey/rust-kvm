@@ -112,20 +112,22 @@ class Ch9329(
         releaseAllKeys()
     }
 
-    internal fun pressUsage(code: Int, shifted: Boolean) {
+    /**
+     * 一次性组合键：带上 [modifiers] 按下再松开 [key]，之后恢复外接键盘当前按住的状态。
+     * [key] 本身是修饰键时只发修饰位（单按 Win 打开开始菜单就是这样）。
+     */
+    fun tap(key: String, modifiers: Set<String> = emptySet()) {
+        val ownBit = Ch9329Maps.CONTROL_KEY_BITS[key]
+        val usage = if (ownBit != null) 0 else Ch9329Maps.KEYBOARD_MAP[key] ?: return
+        pressUsage(usage, modifierBits(modifiers) or (ownBit ?: 0))
+        syncKeyboard()
+    }
+
+    internal fun pressUsage(code: Int, modifierBits: Int) {
         write(
             packet(
                 command = COMMAND_KEYBOARD,
-                data = intArrayOf(
-                    if (shifted) LEFT_SHIFT else 0x00,
-                    0x00,
-                    code,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                ),
+                data = intArrayOf(modifierBits and 0xFF, 0x00, code, 0x00, 0x00, 0x00, 0x00, 0x00),
             ),
         )
     }
@@ -168,13 +170,16 @@ class Ch9329(
         floor(normalized.coerceIn(0f, 1f) * 4096f).toInt().coerceIn(0, 4095)
 
     companion object {
+        fun modifierBits(modifiers: Set<String>): Int =
+            modifiers.fold(0) { bits, key -> bits or (Ch9329Maps.CONTROL_KEY_BITS[key] ?: 0) }
+
+        internal const val LEFT_SHIFT = 0x02
         private const val ADDRESS = 0x00
         private const val COMMAND_KEYBOARD = 0x02
         private const val COMMAND_MOUSE_ABSOLUTE = 0x04
         private const val COMMAND_MOUSE_RELATIVE = 0x05
         private const val HEADER_SIZE = 5
         private const val MAX_KEYS = 6
-        private const val LEFT_SHIFT = 0x02
 
         private val KEYBOARD_RELEASE_PACKET = byteArrayOf(
             0x57, 0xAB.toByte(), 0x00, 0x02, 0x08,

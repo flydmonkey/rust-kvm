@@ -4,7 +4,10 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.remember
@@ -23,6 +26,9 @@ import com.rustkvm.app.ui.SettingsScreen
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 控制页要全屏、要拿到 IME 高度给功能键栏让位，都依赖 edge-to-edge；
+        // 其他页面自己用 safeDrawingPadding 避开系统栏
+        enableEdgeToEdge()
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -32,13 +38,15 @@ class MainActivity : ComponentActivity() {
 
                     NavHost(navController = navController, startDestination = "connect") {
                         composable("connect") {
-                            ConnectScreen(
-                                trustStore = trustStore,
-                                recentServersStore = recentServersStore,
-                                onConnected = { baseUrl ->
-                                    navController.navigate("control/${Uri.encode(baseUrl)}")
-                                },
-                            )
+                            Box(Modifier.fillMaxSize().safeDrawingPadding()) {
+                                ConnectScreen(
+                                    trustStore = trustStore,
+                                    recentServersStore = recentServersStore,
+                                    onConnected = { baseUrl ->
+                                        navController.navigate("control/${Uri.encode(baseUrl)}")
+                                    },
+                                )
+                            }
                         }
                         composable(
                             route = "control/{baseUrl}",
@@ -64,13 +72,15 @@ class MainActivity : ComponentActivity() {
                                 navArgument("baseUrl") { type = NavType.StringType },
                             ),
                         ) { entry ->
-                            SettingsScreen(
-                                baseUrl = Uri.decode(
-                                    requireNotNull(entry.arguments?.getString("baseUrl")),
-                                ),
-                                trustStore = trustStore,
-                                onBack = { navController.popBackStack() },
-                            )
+                            Box(Modifier.fillMaxSize().safeDrawingPadding()) {
+                                SettingsScreen(
+                                    baseUrl = Uri.decode(
+                                        requireNotNull(entry.arguments?.getString("baseUrl")),
+                                    ),
+                                    trustStore = trustStore,
+                                    onBack = { navController.popBackStack() },
+                                )
+                            }
                         }
                     }
                 }
