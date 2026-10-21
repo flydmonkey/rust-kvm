@@ -21,6 +21,7 @@ import com.rustkvm.app.data.RecentServersStore
 import com.rustkvm.app.trust.SharedPrefsCertTrustStore
 import com.rustkvm.app.ui.ConnectScreen
 import com.rustkvm.app.ui.ControlScreen
+import com.rustkvm.app.ui.HostScreen
 import com.rustkvm.app.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
@@ -47,7 +48,15 @@ class MainActivity : ComponentActivity() {
                                             launchSingleTop = true
                                         }
                                     },
+                                    onOpenHost = {
+                                        navController.navigate("host") { launchSingleTop = true }
+                                    },
                                 )
+                            }
+                        }
+                        composable("host") {
+                            Box(Modifier.fillMaxSize().safeDrawingPadding()) {
+                                HostScreen(onBack = { navController.popBackStack() })
                             }
                         }
                         composable(

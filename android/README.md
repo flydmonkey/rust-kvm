@@ -1,6 +1,6 @@
-# rust-kvm Android 客户端（一期）
+# rust-kvm Android 客户端（一期）与宿主机（二期 2a）
 
-Gradle 多模块工程：`app`（Compose UI）、`client`（播放与输入）、`core-protocol`（模型/证书/路径）、`host`（二期占位，**app 不依赖**）。
+Gradle 多模块工程：`app`（Compose UI）、`client`（播放与输入）、`core-protocol`（模型/证书/路径）、`host`（Android 宿主机：HTTPS/WebSocket 服务、USB 串口、前台服务）。
 
 一期目标：手动连接现有 **Windows rust-kvm** 宿主机，实现 MJPEG/H.264 视频、PCM 音频、键鼠（含相对模式）、粘贴、串口接管、基础设置与断线重连。验收清单见 [`ACCEPTANCE.md`](ACCEPTANCE.md)。
 
@@ -63,8 +63,10 @@ export JAVA_HOME=/path/to/jdk-17
 运行单元测试：
 
 ```powershell
-.\gradlew.bat :core-protocol:testDebugUnitTest :client:testDebugUnitTest :app:testDebugUnitTest
+.\gradlew.bat :core-protocol:testDebugUnitTest :client:testDebugUnitTest :host:testDebugUnitTest :app:testDebugUnitTest
 ```
+
+`host` 模块构建时会把仓库根目录的 `web/` 复制进 assets，所以宿主机页面和 Windows 版用的是同一套前端。
 
 ## 安装
 
@@ -110,13 +112,27 @@ Windows rust-kvm 使用**自签名 HTTPS 证书**。客户端采用 **Trust On F
 - **设置页：** 读取 `/api/devices` 与 `/api/config`，可修改视频设备/分辨率/fps/codec/码率、音频开关与窄带、串口端口/波特率/鼠标模式；保存后返回控制页并重连生效。
 - **断线：** WebSocket 断开后指数退避重连（上限约 10s），显示「重连中」；**自动重连不会自动 takeover** 串口。
 
+## 本机作为宿主机（二期 2a，仅键鼠）
+
+一部 Android 手机（或电视盒子）用 OTG 线接上 CH9329，就能代替 Windows 电脑当宿主机，控制 CH9329 连着的那台目标机的键鼠。2a 阶段**没有视频和音频**（采集卡支持是 2b）。
+
+1. 手机用 OTG 线接 CH9329（CH340 / CP210x / FTDI 等常见 USB 串口芯片都支持）。
+2. App 连接页底部点「本机作为宿主机」。
+3. USB 设备列表里点「授权」，在系统弹窗里允许。
+4. 点「启动宿主机」。Android 13+ 会先请求通知权限，状态栏出现常驻通知（服务以前台服务运行，锁屏后继续工作）。
+5. 页面显示访问地址（`https://<手机局域网IP>:8443`）和证书指纹。用另一台设备的浏览器或本 App 的客户端模式连接，核对指纹后信任。
+
+宿主机实现的协议和 Windows 版一致：`/ws/serial`（含接管、忙碌拒绝、断开时发送松键帧、4ms 包间隔）、`/api/config`、`/api/devices`、`/api/serial/ports`、`/cert.crt` 和静态页面。`/ws/video` 只接受连接不出画面；`/ws/audio` 返回「音频不可用」。证书为本机生成的自签名证书，存在 App 私有目录里，局域网 IP 变化时自动重签（指纹会变，客户端需要重新确认）。
+
+停止：页面上点「停止宿主机」，或点通知里的「停止」。
+
 ## 已知限制
 
 - **无** mDNS / 局域网扫描、**无** 录制、**无** 统计 HUD
 - **无** Keyboard Lock 级系统键全捕获
 - **无** CH9329 芯片级配置 UI
 - **无** 鉴权；请仅在可信网络使用
-- **Android 宿主机**（USB 采集卡 + CH9329）为二期，`host` 模块仅占位
+- **Android 宿主机**目前只有键鼠（2a）；USB 采集卡视频（2b）和音频尚未实现
 - 粘贴仅映射常见 US ASCII；不支持的字符会跳过
 - 部分 ROM 杀后台可能断开连接；需保持 App 前台使用
 

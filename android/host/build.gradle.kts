@@ -28,6 +28,7 @@ tasks.named("preBuild") { dependsOn(copyWebAssets) }
 dependencies {
     api(project(":core-protocol"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("io.ktor:ktor-server-core:3.0.3")
     implementation("io.ktor:ktor-server-netty:3.0.3")

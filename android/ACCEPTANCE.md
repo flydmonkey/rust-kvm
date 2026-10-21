@@ -57,8 +57,21 @@
 - 无 Keyboard Lock 级系统键全捕获
 - 无 CH9329 芯片波特率/工作模式配置 UI
 - 无鉴权（与 Windows 服务一致，假定可信局域网或 VPN）
-- Android 宿主机（USB OTG）为二期，见 `host` 模块占位
 - CH9329 ACK 队列为一期简化版（写后不严格等 ACK）；若特定硬件依赖 ACK 需后续收紧
+
+---
+
+## 二期 2a：本机作为宿主机（键鼠）真机验收
+
+准备：一部 Android 8.0+ 手机作宿主机（OTG 线接 CH9329，CH9329 另一端接目标电脑），另一台设备作客户端（浏览器或装了本 App 的手机），两者同一局域网。
+
+1. **授权与启动：** 连接页点「本机作为宿主机」→ USB 设备列表出现串口芯片 → 点「授权」并允许 → 点「启动宿主机」→ 显示「运行中」、`https://<IP>:8443` 和证书指纹，状态栏有常驻通知。
+2. **浏览器客户端：** 另一台电脑浏览器打开该地址 → 证书警告页核对指纹后继续 → 页面加载（与 Windows 版同一套前端）→ 点键鼠图标连接串口 → 在目标电脑上打字、移动鼠标、点击都正常；视频区域无画面属于预期。
+3. **Android 客户端：** 另一部手机用本 App 连接该地址 → TOFU 指纹与宿主机页面显示的一致 → 控制页键盘、触摸鼠标、粘贴可用。
+4. **占用与接管：** 浏览器已占用串口时用 App 连接 → 提示「串口正被另一个控制端占用」；选择接管 → 浏览器端收到「控制权已被另一个客户端接管」；接管期间按住的键在目标机上不会卡住。
+5. **后台与停止：** 宿主机锁屏 5 分钟后客户端仍能操作；拔掉 OTG 线 → 客户端提示「串口连接已中断」；点通知里的「停止」→ 服务停止，客户端断开。
+
+已在 JVM 上自动化覆盖（不需要真机）：串口桥协议（占用、接管、松键帧、4ms 包间隔、拔线）、HTTP 接口形状、证书生成与按 IP 重签，以及「真实 Android 客户端代码经 Netty TLS 连本机宿主机服务打出 KeyA」的端到端测试。真机上才能验证的是 Netty 在 Android 上的运行、USB 权限与 OTG 枚举、前台服务保活。
 
 ---
 
@@ -67,7 +80,7 @@
 ```powershell
 $env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
 cd android
-.\gradlew.bat :app:assembleDebug :core-protocol:testDebugUnitTest :client:testDebugUnitTest :app:testDebugUnitTest
+.\gradlew.bat :app:assembleDebug :core-protocol:testDebugUnitTest :client:testDebugUnitTest :host:testDebugUnitTest :app:testDebugUnitTest
 ```
 
-结果：**BUILD SUCCESSFUL**（2026-09-15）。
+结果：**BUILD SUCCESSFUL**（2026-10-21），136 个单元测试全部通过。

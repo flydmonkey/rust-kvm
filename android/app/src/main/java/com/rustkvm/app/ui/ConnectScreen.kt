@@ -15,6 +15,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -46,6 +47,7 @@ fun ConnectScreen(
     trustStore: CertTrustStore,
     recentServersStore: RecentServersStore,
     onConnected: (String) -> Unit,
+    onOpenHost: () -> Unit = {},
 ) {
     var address by rememberSaveable { mutableStateOf("") }
     var recentServers by remember { mutableStateOf(recentServersStore.get()) }
@@ -148,6 +150,10 @@ fun ConnectScreen(
                 )
                 HorizontalDivider()
             }
+        }
+
+        TextButton(onClick = onOpenHost, enabled = !connecting) {
+            Text("本机作为宿主机（OTG 接 CH9329）")
         }
     }
 
