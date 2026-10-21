@@ -10,6 +10,7 @@ import java.nio.ByteBuffer
 class H264Decoder(
     private val surface: Surface,
     private val onOutputSize: (width: Int, height: Int) -> Unit = { _, _ -> },
+    private val onFrameRendered: () -> Unit = {},
 ) : Closeable {
     private var codec: MediaCodec? = null
     private var sps: ByteArray? = null
@@ -141,6 +142,7 @@ class H264Decoder(
                 else -> {
                     if (outputIndex < 0) return
                     decoder.releaseOutputBuffer(outputIndex, true)
+                    onFrameRendered()
                 }
             }
         }

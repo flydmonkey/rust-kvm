@@ -23,8 +23,15 @@ class VideoPipeline(
     private val surface: Surface,
     private val onVideoSize: (width: Int, height: Int) -> Unit = { _, _ -> },
     private val onCodec: (codec: String, fallbackReason: String?) -> Unit = { _, _ -> },
+    /** 非空表示 H.264 反复解码失败、该建议用户改 MJPEG；恢复出画面后回调 null。 */
+    private val onDecodeProblem: (message: String?) -> Unit = {},
 ) {
     private var reportedSize = 0 to 0
+    private val decodeFailures = DecodeFailureTracker()
+
+    private fun onH264FrameRendered() {
+        if (decodeFailures.onFrameRendered()) onDecodeProblem(null)
+    }
 
     private fun reportSize(width: Int, height: Int) {
         if (reportedSize == width to height) return
@@ -70,10 +77,11 @@ class VideoPipeline(
                                 h264Decoder?.close()
                                 codec = parsed.codec.lowercase()
                                 h264Decoder = if (codec == H264_CODEC && parsed.avcCodec != null) {
-                                    H264Decoder(surface, ::reportSize)
+                                    H264Decoder(surface, ::reportSize, ::onH264FrameRendered)
                                 } else {
                                     null
                                 }
+                                if (codec != H264_CODEC && decodeFailures.reset()) onDecodeProblem(null)
                                 onCodec(codec ?: parsed.codec, parsed.fallbackReason)
                             }
 
@@ -83,6 +91,9 @@ class VideoPipeline(
                         is StreamMessage.Binary -> when (codec) {
                             MJPEG_CODEC -> latestJpeg = message.data
                             H264_CODEC -> if (h264Decoder?.queue(message.data) == false) {
+                                if (decodeFailures.onFailure()) {
+                                    onDecodeProblem("本机 H.264 解码反复失败，可在设置里把编码改成 MJPEG")
+                                }
                                 reopenVideo("H.264 decoder failed")
                                 break@batch
                             }

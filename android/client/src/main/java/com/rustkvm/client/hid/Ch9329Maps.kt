@@ -37,7 +37,7 @@ object Ch9329Maps {
                 "ShiftLeft" to 0xE1, "ShiftRight" to 0xE5, "Shift" to 0xE1,
                 "ControlLeft" to 0xE0, "ControlRight" to 0xE4, "Control" to 0xE0,
                 "AltLeft" to 0xE2, "AltRight" to 0xE6, "Alt" to 0xE2,
-                "MetaLeft" to 0xE3, "MetaRight" to 0xE7,
+                "MetaLeft" to 0xE3, "MetaRight" to 0xE7, "Meta" to 0xE3,
             ),
         )
         for (index in 0..25) {
@@ -64,5 +64,10 @@ object Ch9329Maps {
         "AltRight" to 0x40,
         "MetaLeft" to 0x08,
         "MetaRight" to 0x80,
+        // 不分左右的别名按左侧处理，否则会被当成普通键塞进按键槽
+        "Shift" to 0x02,
+        "Control" to 0x01,
+        "Alt" to 0x04,
+        "Meta" to 0x08,
     )
 }

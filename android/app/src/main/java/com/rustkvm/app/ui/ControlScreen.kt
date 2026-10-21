@@ -126,6 +126,7 @@ fun ControlScreen(
     val keyInputs = remember(baseUrl) { Channel<KeyInput>(Channel.UNLIMITED) }
     var latchedModifiers by remember(baseUrl) { mutableStateOf(emptySet<String>()) }
     var videoNotice by remember(baseUrl) { mutableStateOf<String?>(null) }
+    var decodeProblem by remember(baseUrl) { mutableStateOf<String?>(null) }
     val imeVisible = WindowInsets.isImeVisible
     val clipboard = LocalClipboardManager.current
     val uiScope = rememberCoroutineScope()
@@ -242,6 +243,7 @@ fun ControlScreen(
             try {
                 state = if (hasStreamed) ControlState.Reconnecting else ControlState.Connecting
                 audioError = null
+                decodeProblem = null
                 val loadedConfig = client.getConfig()
                 config = loadedConfig
                 absoluteMouse = loadedConfig.serial.mouseMode != "relative"
@@ -274,12 +276,18 @@ fun ControlScreen(
                             onCodec = { _, fallbackReason ->
                                 videoNotice = fallbackReason?.let { "H.264 不可用，已退回 MJPEG：$it" }
                             },
+                            onDecodeProblem = { decodeProblem = it },
                         ).run()
                     }
                     launch(Dispatchers.IO) {
                         try {
                             while (true) {
-                                val batch = session.audioMessages.receiveBatch() ?: break
+                                val batch = session.audioMessages.receiveBatch()
+                                if (batch == null) {
+                                    // 服务端正常关掉音频时不会先发 error，这里不说一声声音就悄悄没了
+                                    audioError = "服务端关闭了音频流"
+                                    break
+                                }
                                 for (message in trimAudioBacklog(batch)) {
                                     when (message) {
                                         is StreamMessage.Text -> {
@@ -476,7 +484,7 @@ fun ControlScreen(
                         .padding(horizontal = 12.dp, vertical = 6.dp),
                 )
             }
-            listOfNotNull(videoNotice, audioError?.let { "音频不可用：$it" }).forEach { message ->
+            listOfNotNull(videoNotice, decodeProblem, audioError?.let { "音频不可用：$it" }).forEach { message ->
                 Text(
                     text = message,
                     color = MaterialTheme.colorScheme.error,

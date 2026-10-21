@@ -37,6 +37,17 @@ class Ch9329Test {
     }
 
     @Test
+    fun genericModifierNamesSetModifierBitsInsteadOfKeySlots() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(absoluteMouse = true) { frames += it }
+
+        ch.keydown("Control")
+
+        assertEquals(0x01, frames.last()[5].toInt())
+        assertEquals(0x00, frames.last()[7].toInt())
+    }
+
+    @Test
     fun tappingAModifierAloneSendsOnlyItsBit() {
         val frames = mutableListOf<ByteArray>()
         val ch = Ch9329(absoluteMouse = true) { frames += it }
