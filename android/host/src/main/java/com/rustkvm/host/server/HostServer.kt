@@ -1,4 +1,4 @@
-﻿package com.rustkvm.host.server
+package com.rustkvm.host.server
 
 import com.rustkvm.host.tls.SelfSignedCert
 import io.ktor.server.engine.EmbeddedServer

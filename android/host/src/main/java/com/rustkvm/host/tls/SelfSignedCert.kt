@@ -1,4 +1,4 @@
-﻿package com.rustkvm.host.tls
+package com.rustkvm.host.tls
 
 import com.rustkvm.protocol.sha256Fingerprint
 import org.bouncycastle.asn1.x500.X500Name
