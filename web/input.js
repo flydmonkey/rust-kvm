@@ -697,7 +697,24 @@
         isKeyboardBusy: keysSuppressed,
 
         // 芯片当前的键盘指示灯状态，粘贴前用来提示 Caps Lock
-        refreshInfo
+        refreshInfo,
+
+        // 切换被控机配置后用：重读配置，按新的串口和鼠标模式重连。
+        // 控制权在别人手里时不重连——那等于自动抢，见 statusButton 的点击处理
+        async reconnect() {
+            if (busy || connecting) {
+                return false;
+            }
+            cancelReconnect();
+            portName = null;
+            await loadSettings();
+            await resolvePort();
+            if (!portName || connecting) {
+                return false;
+            }
+            await connect(false);
+            return !!ch && !serialLost;
+        }
     };
 
     // 打开页面就连。原来要手点一下，但那一下没有任何信息量——串口和鼠标模式都在

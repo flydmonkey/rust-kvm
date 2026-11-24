@@ -38,6 +38,20 @@
     // 快捷键面板也要往这条提示里报结果
     window.KvmToast = toast;
 
+    // 工具栏旁的面板同一时刻只开一个。面板用 data-toggle 指向打开它的按钮
+    window.KvmClosePanels = function (except) {
+        document.querySelectorAll(".tool-panel").forEach((panel) => {
+            if (panel === except) {
+                return;
+            }
+            panel.hidden = true;
+            const toggle = document.getElementById(panel.dataset.toggle);
+            if (toggle) {
+                toggle.classList.remove("active");
+            }
+        });
+    };
+
     // ---------------------------------------------------------------------
     // 全屏 + Keyboard Lock
     // ---------------------------------------------------------------------

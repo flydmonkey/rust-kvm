@@ -92,11 +92,7 @@
     }
 
     function closeOtherPanels() {
-        const shortcutPanel = document.getElementById("shortcut-panel");
-        if (shortcutPanel) {
-            shortcutPanel.hidden = true;
-            document.getElementById("shortcuts").classList.remove("active");
-        }
+        KvmClosePanels(panel);
     }
 
     function setPanelOpen(open) {

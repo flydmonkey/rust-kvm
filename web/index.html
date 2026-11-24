@@ -4,11 +4,13 @@
     <meta charset="utf-8">
     <title>rust-kvm</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="theme.css">
+    <script src="theme.js"></script>
     <style>
         html, body {
             margin: 0;
             height: 100%;
-            background: #000;
+            background: var(--video-bg);
             overflow: hidden;
         }
 
@@ -31,9 +33,9 @@
             position: fixed;
             padding: 8px 10px;
             border-radius: 6px;
-            background: rgba(24, 24, 27, 0.78);
+            background: var(--overlay-bg);
             backdrop-filter: blur(8px);
-            color: #e4e4e7;
+            color: var(--text);
             font: 12px/1.6 ui-monospace, Consolas, monospace;
         }
 
@@ -60,13 +62,13 @@
             align-items: center;
             gap: 2px;
             padding: 8px 7px;
-            background-color: rgba(24, 24, 27, 0.72);
+            background-color: var(--glass);
             backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--tint-08);
             border-left: none;
             border-radius: 0 12px 12px 0;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-            color: #e4e4e7;
+            box-shadow: 0 8px 24px var(--shadow-color);
+            color: var(--text);
             z-index: 1000;
             transition: transform 0.25s ease;
         }
@@ -93,21 +95,25 @@
             transition: background-color 0.15s, color 0.15s;
         }
 
+        .floating-toolbar button[hidden] {
+            display: none;
+        }
+
         .floating-toolbar button:hover {
-            background-color: rgba(255, 255, 255, 0.12);
+            background-color: var(--tint-12);
         }
 
         .floating-toolbar button:active {
-            background-color: rgba(255, 255, 255, 0.2);
+            background-color: var(--tint-20);
         }
 
         .floating-toolbar button:focus-visible {
-            outline: 2px solid #60a5fa;
+            outline: 2px solid var(--accent);
             outline-offset: -2px;
         }
 
         .floating-toolbar button:disabled {
-            color: #52525b;
+            color: var(--text-disabled);
             cursor: default;
             background-color: transparent;
         }
@@ -121,19 +127,19 @@
         /* 状态指示：灰=未连接，绿=正常，黄=可用但有问题，红=失败。
            画面、键鼠、声音各一个。图标本身变色，不另占一行文字。 */
         .status-indicator.status-idle {
-            color: #a1a1aa;
+            color: var(--text-muted);
         }
 
         .status-indicator.status-ok {
-            color: #3ddc84;
+            color: var(--ok-strong);
         }
 
         .status-indicator.status-warn {
-            color: #ffc107;
+            color: var(--warn-strong);
         }
 
         .status-indicator.status-error {
-            color: #f87171;
+            color: var(--error);
         }
 
         /* 功能分组之间的细分隔线 */
@@ -141,7 +147,7 @@
             width: 22px;
             height: 1px;
             margin: 4px 0;
-            background-color: rgba(255, 255, 255, 0.12);
+            background-color: var(--tint-12);
         }
 
         /* 全屏按钮按当前状态切换图标 */
@@ -159,12 +165,12 @@
 
         /* 叠加层关掉之后图标也暗下来，否则看不出当前是开还是关 */
         #toggle-stats.off {
-            color: #52525b;
+            color: var(--text-disabled);
         }
 
         /* 录制中必须一眼看得出来——忘了自己在录，磁盘会悄悄被填满 */
         #record.recording {
-            color: #f87171;
+            color: var(--error);
         }
 
         .tooltip {
@@ -172,8 +178,8 @@
             top: 50%;
             left: calc(100% + 10px);
             transform: translateY(-50%);
-            background-color: rgba(24, 24, 27, 0.95);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            background-color: var(--tooltip-bg);
+            border: 1px solid var(--tint-10);
             border-radius: 6px;
             padding: 5px 9px;
             font: 12px/1.5 system-ui, sans-serif;
@@ -181,7 +187,7 @@
             opacity: 0;
             pointer-events: none;
             transition: opacity 0.15s;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+            box-shadow: 0 4px 12px var(--shadow-color);
         }
 
         .tooltip::before {
@@ -191,7 +197,7 @@
             right: 100%;
             transform: translateY(-50%);
             border: 5px solid transparent;
-            border-right-color: rgba(24, 24, 27, 0.95);
+            border-right-color: var(--tooltip-bg);
         }
 
         .floating-toolbar button:hover .tooltip,
@@ -221,9 +227,9 @@
             transform: translateY(-50%);
             width: 18px;
             height: 42px;
-            background-color: rgba(24, 24, 27, 0.72);
+            background-color: var(--glass);
             backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--tint-08);
             border-left: none;
             border-radius: 0 8px 8px 0;
         }
@@ -254,20 +260,20 @@
         }
 
         #toast.ok {
-            color: #4ade80;
+            color: var(--ok);
         }
 
         #toast.warn {
-            color: #fbbf24;
+            color: var(--warn);
         }
 
         #toast.error {
-            color: #f87171;
+            color: var(--error);
         }
 
         #shortcuts.active,
         #ocr.active {
-            color: #60a5fa;
+            color: var(--accent);
         }
 
         /* ---- 文字识别：全屏框选遮罩 + 结果面板 ---- */
@@ -288,7 +294,7 @@
 
         #ocr-box {
             position: fixed;
-            border: 2px solid #60a5fa;
+            border: 2px solid var(--accent);
             background: rgba(96, 165, 250, 0.15);
             pointer-events: none;
         }
@@ -304,9 +310,9 @@
             width: 100%;
             min-height: 160px;
             padding: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
+            border: 1px solid var(--tint-15);
             border-radius: 8px;
-            background: rgba(0, 0, 0, 0.3);
+            background: var(--input-bg);
             color: inherit;
             font: 13px/1.5 ui-monospace, Consolas, monospace;
             resize: vertical;
@@ -320,19 +326,20 @@
 
         .ocr-actions button {
             padding: 5px 10px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
+            border: 1px solid var(--tint-15);
             border-radius: 6px;
-            background: rgba(255, 255, 255, 0.06);
+            background: var(--tint-06);
         }
 
         .ocr-actions button.primary {
             margin-left: auto;
             border-color: transparent;
-            background: #2563eb;
+            background: var(--primary);
+            color: var(--on-primary);
         }
 
         .ocr-actions button:disabled {
-            color: #71717a;
+            color: var(--text-faint);
             cursor: default;
         }
 
@@ -347,12 +354,12 @@
             max-height: 86vh;
             overflow-y: auto;
             padding: 10px 12px 12px;
-            background-color: rgba(24, 24, 27, 0.92);
+            background-color: var(--glass-strong);
             backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--tint-08);
             border-radius: 12px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-            color: #e4e4e7;
+            box-shadow: 0 8px 24px var(--shadow-color);
+            color: var(--text);
             font: 13px/1.5 system-ui, sans-serif;
             z-index: 1001;
         }
@@ -375,6 +382,50 @@
             margin-bottom: 6px;
         }
 
+        .profile-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .profile-item {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            padding: 6px 10px;
+            border: 1px solid var(--tint-10);
+            border-radius: 8px;
+            background: var(--tint-04);
+            text-align: left;
+        }
+
+        .profile-item:hover:not(:disabled) {
+            background: var(--tint-12);
+        }
+
+        .profile-item.current {
+            border-color: var(--accent);
+        }
+
+        .profile-item:disabled {
+            cursor: default;
+            opacity: 0.6;
+        }
+
+        .profile-summary {
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        .tool-panel a {
+            color: var(--accent);
+        }
+
+        #profile-close,
         #shortcut-close,
         #ocr-close {
             border: none;
@@ -385,9 +436,10 @@
             border-radius: 6px;
         }
 
+        #profile-close:hover,
         #shortcut-close:hover,
         #ocr-close:hover {
-            background-color: rgba(255, 255, 255, 0.12);
+            background-color: var(--tint-12);
         }
 
         .shortcut-repeat-row {
@@ -398,9 +450,9 @@
 
         #shortcut-stop {
             display: none;
-            border: 1px solid #f87171;
+            border: 1px solid var(--error);
             background: rgba(248, 113, 113, 0.15);
-            color: #fca5a5;
+            color: var(--error-text);
             border-radius: 6px;
             padding: 2px 10px;
         }
@@ -411,7 +463,7 @@
 
         .shortcut-hint {
             margin: 4px 0 8px;
-            color: #a1a1aa;
+            color: var(--text-muted);
             font-size: 12px;
         }
 
@@ -420,7 +472,7 @@
             margin: 10px 0 6px;
             font-size: 12px;
             font-weight: 600;
-            color: #a1a1aa;
+            color: var(--text-muted);
         }
 
         .shortcut-grid {
@@ -441,14 +493,14 @@
             flex-direction: column;
             align-items: flex-start;
             padding: 5px 8px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--tint-10);
             border-radius: 8px;
-            background: rgba(255, 255, 255, 0.04);
+            background: var(--tint-04);
             text-align: left;
         }
 
         .shortcut-run:hover {
-            background: rgba(255, 255, 255, 0.12);
+            background: var(--tint-12);
         }
 
         .shortcut-label,
@@ -461,7 +513,7 @@
 
         .shortcut-combo {
             font: 11px/1.4 ui-monospace, Consolas, monospace;
-            color: #93c5fd;
+            color: var(--accent-text);
         }
 
         .shortcut-delete {
@@ -470,12 +522,12 @@
             border: none;
             border-radius: 6px;
             background: transparent;
-            color: #a1a1aa;
+            color: var(--text-muted);
         }
 
         .shortcut-delete:hover {
-            color: #f87171;
-            background: rgba(255, 255, 255, 0.08);
+            color: var(--error);
+            background: var(--tint-08);
         }
 
         .shortcut-form {
@@ -483,7 +535,7 @@
             flex-wrap: wrap;
             gap: 6px;
             margin-top: 6px;
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            border-top: 1px solid var(--tint-08);
         }
 
         .shortcut-form h3 {
@@ -494,9 +546,9 @@
             flex: 1 1 120px;
             min-width: 0;
             padding: 5px 8px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
+            border: 1px solid var(--tint-15);
             border-radius: 6px;
-            background: rgba(0, 0, 0, 0.3);
+            background: var(--input-bg);
             color: inherit;
             font: inherit;
         }
@@ -505,13 +557,14 @@
             padding: 5px 12px;
             border: none;
             border-radius: 6px;
-            background: #2563eb;
+            background: var(--primary);
+            color: var(--on-primary);
         }
 
         .shortcut-error {
             width: 100%;
             margin: 0;
-            color: #f87171;
+            color: var(--error);
             font-size: 12px;
         }
 
@@ -663,6 +716,17 @@ Win+L、Alt+Tab、BIOS 热键等
 
     <div class="toolbar-divider"></div>
 
+    <button id="profiles" type="button" aria-label="切换被控机" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="3" width="13" height="9" rx="1.5"/>
+            <rect x="9" y="12" width="13" height="9" rx="1.5"/>
+            <path d="M5 15v2a2 2 0 0 0 2 2"/>
+            <path d="M19 9V7a2 2 0 0 0-2-2"/>
+        </svg>
+        <span class="tooltip">切换被控机
+在设置页存好的几份配置之间切换</span>
+    </button>
     <button id="open-settings" type="button" aria-label="设置">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
              stroke-linejoin="round" aria-hidden="true">
@@ -694,7 +758,17 @@ Win+L、Alt+Tab、BIOS 热键等
     </button>
 </div>
 
-<div id="shortcut-panel" class="tool-panel" hidden>
+<div id="profile-panel" class="tool-panel" data-toggle="profiles" hidden>
+    <div class="tool-panel-header">
+        <span>切换被控机</span>
+        <button id="profile-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <p class="shortcut-hint">切换后画面自动重开，键鼠会重新连接到这份配置的串口。</p>
+    <div id="profile-list" class="profile-list"></div>
+    <p class="shortcut-hint"><a href="settings.html">在设置页添加或修改配置</a></p>
+</div>
+
+<div id="shortcut-panel" class="tool-panel" data-toggle="shortcuts" hidden>
     <div class="tool-panel-header">
         <span>快捷键</span>
         <button id="shortcut-close" type="button" aria-label="关闭">×</button>
@@ -720,7 +794,7 @@ Win+L、Alt+Tab、BIOS 热键等
     <div id="ocr-box" hidden></div>
 </div>
 
-<div id="ocr-panel" class="tool-panel" hidden>
+<div id="ocr-panel" class="tool-panel" data-toggle="ocr" hidden>
     <div class="tool-panel-header">
         <span>识别文字</span>
         <button id="ocr-close" type="button" aria-label="关闭">×</button>
@@ -747,5 +821,7 @@ Win+L、Alt+Tab、BIOS 热键等
 <script src="shortcut-panel.js"></script>
 <script src="ocr.js"></script>
 <script src="ocr-panel.js"></script>
+<script src="profiles.js"></script>
+<script src="profile-panel.js"></script>
 </body>
 </html>
