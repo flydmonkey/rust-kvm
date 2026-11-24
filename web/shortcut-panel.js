@@ -260,6 +260,11 @@
         button.classList.toggle("active", open);
         if (open) {
             render();
+            const ocrPanel = document.getElementById("ocr-panel");
+            if (ocrPanel) {
+                ocrPanel.hidden = true;
+                document.getElementById("ocr").classList.remove("active");
+            }
         }
     }
 

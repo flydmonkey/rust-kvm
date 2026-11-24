@@ -265,8 +265,75 @@
             color: #f87171;
         }
 
-        #shortcuts.active {
+        #shortcuts.active,
+        #ocr.active {
             color: #60a5fa;
+        }
+
+        /* ---- 文字识别：全屏框选遮罩 + 结果面板 ---- */
+        #ocr-overlay {
+            position: fixed;
+            inset: 0;
+            cursor: crosshair;
+            background: rgba(0, 0, 0, 0.15);
+            /* 盖住画面但让工具栏还能点（工具栏是 1000） */
+            z-index: 999;
+            touch-action: none;
+        }
+
+        #ocr-overlay[hidden],
+        #ocr-box[hidden] {
+            display: none;
+        }
+
+        #ocr-box {
+            position: fixed;
+            border: 2px solid #60a5fa;
+            background: rgba(96, 165, 250, 0.15);
+            pointer-events: none;
+        }
+
+        .ocr-langs {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+
+        #ocr-text {
+            box-sizing: border-box;
+            width: 100%;
+            min-height: 160px;
+            padding: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            color: inherit;
+            font: 13px/1.5 ui-monospace, Consolas, monospace;
+            resize: vertical;
+        }
+
+        .ocr-actions {
+            display: flex;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .ocr-actions button {
+            padding: 5px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.06);
+        }
+
+        .ocr-actions button.primary {
+            margin-left: auto;
+            border-color: transparent;
+            background: #2563eb;
+        }
+
+        .ocr-actions button:disabled {
+            color: #71717a;
+            cursor: default;
         }
 
         /* ---- 快捷键面板：贴在工具栏右边，内容多时自己滚动 ---- */
@@ -308,7 +375,8 @@
             margin-bottom: 6px;
         }
 
-        #shortcut-close {
+        #shortcut-close,
+        #ocr-close {
             border: none;
             background: transparent;
             font-size: 18px;
@@ -317,7 +385,8 @@
             border-radius: 6px;
         }
 
-        #shortcut-close:hover {
+        #shortcut-close:hover,
+        #ocr-close:hover {
             background-color: rgba(255, 255, 255, 0.12);
         }
 
@@ -541,19 +610,19 @@
 
     <div class="toolbar-divider"></div>
 
-    <button id="ctrl-alt-del" type="button" aria-label="发送 Ctrl+Alt+Delete">
+    <button id="ocr" type="button" aria-label="识别文字">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
              stroke-linejoin="round" aria-hidden="true">
-            <rect x="2" y="4" width="20" height="16" rx="2"/>
-            <path d="M6 9h.01"/>
-            <path d="M10 9h.01"/>
-            <path d="M14 9h.01"/>
-            <path d="M18 9h.01"/>
-            <path d="M7 15h10"/>
+            <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
+            <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+            <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
+            <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+            <path d="M8 8h8"/>
+            <path d="M12 8v8"/>
         </svg>
-        <span class="tooltip">Ctrl+Alt+Delete
-由芯片直接发给被控端
-和本机按了什么无关</span>
+        <span class="tooltip">识别文字
+框选画面上的一块，在本机识别成文字
+蓝屏错误码、BIOS 信息都能拿回来</span>
     </button>
     <button id="shortcuts" type="button" aria-label="快捷键">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
@@ -646,6 +715,26 @@ Win+L、Alt+Tab、BIOS 热键等
     </form>
 </div>
 
+<!-- 框选文字时盖在整个页面上，鼠标键盘都不会漏给被控端 -->
+<div id="ocr-overlay" hidden>
+    <div id="ocr-box" hidden></div>
+</div>
+
+<div id="ocr-panel" class="tool-panel" hidden>
+    <div class="tool-panel-header">
+        <span>识别文字</span>
+        <button id="ocr-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div id="ocr-langs" class="ocr-langs"></div>
+    <textarea id="ocr-text" spellcheck="false" placeholder="识别结果会出现在这里，可以直接改"></textarea>
+    <div class="ocr-actions">
+        <button id="ocr-again" type="button">重新框选</button>
+        <button id="ocr-whole" type="button">识别整个画面</button>
+        <button id="ocr-copy" type="button" class="primary">复制</button>
+    </div>
+    <p class="shortcut-hint">识别完全在本机浏览器里进行，画面不会发到任何服务器。第一次用要加载约 10 MB 的引擎和语言包。</p>
+</div>
+
 <div id="toast" class="overlay"></div>
 <script src="ch9329.js"></script>
 <script src="status-text.js"></script>
@@ -656,5 +745,7 @@ Win+L、Alt+Tab、BIOS 热键等
 <script src="toolbar.js"></script>
 <script src="shortcuts.js"></script>
 <script src="shortcut-panel.js"></script>
+<script src="ocr.js"></script>
+<script src="ocr-panel.js"></script>
 </body>
 </html>

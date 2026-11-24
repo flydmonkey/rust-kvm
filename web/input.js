@@ -652,15 +652,6 @@
     window.KvmInput = {
         isReady: () => !!ch && !serialLost,
 
-        ctrlAltDel() {
-            if (!ch || serialLost) {
-                throw new Error("键鼠未连接");
-            }
-            // 本机的 Ctrl+Alt+Del 被系统吃掉，拦不住也没必要拦：这里是直接让
-            // 芯片对被控端发出这个组合键的 HID 报告，跟本机按了什么无关。
-            return ch.sendCtrlAltDelete();
-        },
-
         releaseAll() {
             if (!ch) {
                 throw new Error("键鼠未连接");
