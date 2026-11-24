@@ -49,6 +49,29 @@
         return document.pointerLockElement === screenEl;
     }
 
+    function isEditableTarget(target) {
+        if (!target || !target.tagName) {
+            return false;
+        }
+        return target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+    }
+
+    function inToolPanel(target) {
+        return !!(target && target.closest && target.closest(".tool-panel"));
+    }
+
+    // 粘贴、开机连按各自占着键盘时 >0。计数而不是布尔：两者理论上不会重叠，
+    // 但真重叠了也不至于一方结束就把另一方的屏蔽提前解除
+    let keyboardBusy = 0;
+
+    function keysSuppressed() {
+        return keyboardBusy > 0;
+    }
+
+    // 每次连上（含重连）加一。连按循环靠它判断「还是不是开始时那条连接」——
+    // 断线重连后芯片对象换了，接着往新连接上连按不是任何人想要的
+    let session = 0;
+
     function renderStatus(override) {
         if (override) {
             // 覆盖是调用方在说「就显示这句」，不要再追加连接提示和延迟读数——
@@ -325,6 +348,7 @@
             };
             setAckWait(false);
             cancelReconnect();
+            session += 1;
         } catch (error) {
             // 被拒的原因只在服务端那条 error 里。调用方拿到的往往是随后连接断开
             // 产生的「串口桥已断开」——更晚、更没信息量，正好把真正的原因盖住，
@@ -451,14 +475,23 @@
         screenEl.style.cursor = "none";
 
         document.addEventListener("keydown", (event) => {
+            // 快捷键面板里填自定义快捷键时，按键是给输入框的，不能发给被控端
+            if (isEditableTarget(event.target)) {
+                return;
+            }
             event.preventDefault();
-            if (ch) {
+            // 粘贴和开机连按期间，用户的按键会和模拟敲键的报告互相覆盖，先不转发
+            if (ch && !keysSuppressed()) {
                 ch.keydown(event.code);
             }
         });
 
         document.addEventListener("keyup", (event) => {
+            if (isEditableTarget(event.target)) {
+                return;
+            }
             event.preventDefault();
+            // 抬起照常转发：屏蔽前按下的键要是松开也被吞掉，本地状态就一直记着它按着
             if (ch) {
                 ch.keyup(event.code);
             }
@@ -467,7 +500,8 @@
         // 累积滚动量再按齿数下发，保留滚动快慢
         let wheelPixels = 0;
         document.addEventListener("wheel", (event) => {
-            if (!ch) {
+            // 面板内容多时要能滚动，滚轮不能漏成被控端的滚动
+            if (!ch || inToolPanel(event.target)) {
                 return;
             }
             let delta = event.deltaY;
@@ -618,15 +652,6 @@
     window.KvmInput = {
         isReady: () => !!ch && !serialLost,
 
-        ctrlAltDel() {
-            if (!ch || serialLost) {
-                throw new Error("键鼠未连接");
-            }
-            // 本机的 Ctrl+Alt+Del 被系统吃掉，拦不住也没必要拦：这里是直接让
-            // 芯片对被控端发出这个组合键的 HID 报告，跟本机按了什么无关。
-            return ch.sendCtrlAltDelete();
-        },
-
         releaseAll() {
             if (!ch) {
                 throw new Error("键鼠未连接");
@@ -641,11 +666,55 @@
             // 不开 ACK：typeText 每个字符是「按下 + 抬起」两包，开了 ACK 就要
             // 跨网络等两次应答，82ms 的链路上一个字符要三分之一秒。关掉之后走
             // ch9329.js 自己的 20ms 包间隔，一个字符 40ms。
-            return ch.typeText(text);
+            keyboardBusy += 1;
+            try {
+                return await ch.typeText(text);
+            } finally {
+                keyboardBusy -= 1;
+            }
         },
 
+        // 快捷键面板用：按一下组合键再全部松开。codes 是 KeyboardEvent.code。
+        // 返回 false 表示没发出去（未连接、换了连接、或有协议层不认识的键）。
+        async tapCombo(codes, expectedSession) {
+            if (!ch || serialLost) {
+                return false;
+            }
+            if (expectedSession !== undefined && expectedSession !== session) {
+                return false;
+            }
+            return ch.tapCombo(codes);
+        },
+
+        // 当前连接的编号，没连上是 -1
+        session: () => (ch && !serialLost ? session : -1),
+
+        // 开机连按期间屏蔽用户键盘，结束时必须配对调用 false
+        holdKeyboard(on) {
+            keyboardBusy = Math.max(0, keyboardBusy + (on ? 1 : -1));
+        },
+
+        isKeyboardBusy: keysSuppressed,
+
         // 芯片当前的键盘指示灯状态，粘贴前用来提示 Caps Lock
-        refreshInfo
+        refreshInfo,
+
+        // 切换被控机配置后用：重读配置，按新的串口和鼠标模式重连。
+        // 控制权在别人手里时不重连——那等于自动抢，见 statusButton 的点击处理
+        async reconnect() {
+            if (busy || connecting) {
+                return false;
+            }
+            cancelReconnect();
+            portName = null;
+            await loadSettings();
+            await resolvePort();
+            if (!portName || connecting) {
+                return false;
+            }
+            await connect(false);
+            return !!ch && !serialLost;
+        }
     };
 
     // 打开页面就连。原来要手点一下，但那一下没有任何信息量——串口和鼠标模式都在

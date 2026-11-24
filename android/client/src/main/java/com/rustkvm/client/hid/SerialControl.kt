@@ -135,6 +135,8 @@ class SerialControl<S : SerialConnection>(
 
     fun tapKey(key: String, modifiers: Set<String> = emptySet()) = requireHid().tap(key, modifiers)
 
+    fun tapCombo(codes: List<String>): Boolean = requireHid().tapCombo(codes)
+
     suspend fun typeText(text: String, modifiers: Set<String>): PasteResult =
         checkNotNull(pasteTyper) { "Serial control is not open" }
             .typeText(text, Ch9329.modifierBits(modifiers))

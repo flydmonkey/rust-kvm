@@ -4,16 +4,14 @@
     <meta charset="utf-8">
     <title>rust-kvm 设置</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="theme.css">
+    <script src="theme.js"></script>
     <style>
-        :root {
-            color-scheme: dark;
-        }
-
         body {
             margin: 0;
             padding: 24px 16px 64px;
-            background: #09090b;
-            color: #e4e4e7;
+            background: var(--page-bg);
+            color: var(--text);
             font: 14px/1.7 system-ui, "Microsoft YaHei", sans-serif;
         }
 
@@ -28,16 +26,16 @@
         }
 
         .lede {
-            color: #a1a1aa;
+            color: var(--text-muted);
             margin: 0 0 24px;
         }
 
         a {
-            color: #60a5fa;
+            color: var(--accent);
         }
 
         section {
-            border: 1px solid #27272a;
+            border: 1px solid var(--section-border);
             border-radius: 8px;
             padding: 16px;
             margin-bottom: 16px;
@@ -57,16 +55,16 @@
         }
 
         .field > label {
-            color: #a1a1aa;
+            color: var(--text-muted);
         }
 
         select, input[type="text"] {
             width: 100%;
             padding: 6px 8px;
-            border: 1px solid #3f3f46;
+            border: 1px solid var(--field-border);
             border-radius: 4px;
-            background: #18181b;
-            color: #e4e4e7;
+            background: var(--field-bg);
+            color: var(--text);
             font: inherit;
         }
 
@@ -81,11 +79,11 @@
             display: flex;
             gap: 8px;
             align-items: center;
-            color: #a1a1aa;
+            color: var(--text-muted);
         }
 
         .hint {
-            color: #71717a;
+            color: var(--text-faint);
             font-size: 13px;
             margin: 8px 0 0;
         }
@@ -93,9 +91,9 @@
         /* 枚举失败的原因——尤其音频那条远程桌面的解释——必须显眼，
            否则用户只会看到一个空下拉框然后无从下手 */
         .problem {
-            border: 1px solid #7f1d1d;
-            background: #1f1315;
-            color: #fca5a5;
+            border: 1px solid var(--error-border);
+            background: var(--error-bg);
+            color: var(--error-text);
             border-radius: 6px;
             padding: 10px 12px;
             margin: 0 0 12px;
@@ -106,7 +104,7 @@
         }
 
         .live {
-            color: #71717a;
+            color: var(--text-faint);
             font: 12px/1.6 ui-monospace, Consolas, monospace;
             white-space: pre-wrap;
             margin: 10px 0 0;
@@ -123,22 +121,45 @@
 
         button {
             padding: 8px 16px;
-            border: 1px solid #3f3f46;
+            border: 1px solid var(--field-border);
             border-radius: 4px;
-            background: #18181b;
-            color: #e4e4e7;
+            background: var(--field-bg);
+            color: var(--text);
             font: inherit;
             cursor: pointer;
         }
 
         button.primary {
-            background: #1d4ed8;
-            border-color: #1d4ed8;
+            background: var(--primary-strong);
+            border-color: var(--primary-strong);
+            color: var(--on-primary);
+        }
+
+        .profile-name-row {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .profile-name-row[hidden] {
+            display: none;
+        }
+
+        .profile-name-row input {
+            flex: 1;
+        }
+
+        #profile-status.ok {
+            color: var(--ok);
+        }
+
+        #profile-status.error {
+            color: var(--error);
         }
 
         button.danger {
-            border-color: #7f1d1d;
-            color: #fca5a5;
+            border-color: var(--error-border);
+            color: var(--error-text);
         }
 
         /* 四个按钮在窄屏上要能换行，别横着挤成一条 */
@@ -155,16 +176,16 @@
         }
 
         #save-status.ok, #chip-status.ok {
-            color: #4ade80;
+            color: var(--ok);
         }
 
         #save-status.error, #chip-status.error {
-            color: #f87171;
+            color: var(--error);
         }
 
         /* 写芯片要断电重插才生效，这句提醒得比普通成功消息更抓眼 */
         #chip-status.warn {
-            color: #fbbf24;
+            color: var(--warn);
         }
     </style>
 </head>
@@ -173,6 +194,41 @@
     <h1>rust-kvm 设置</h1>
     <p class="lede">设备列表由宿主机枚举——远程浏览器没有本机的摄像头和串口权限。
         <a href="/">返回控制页</a></p>
+
+    <section>
+        <h2>外观</h2>
+        <div class="field">
+            <label for="theme-select">主题</label>
+            <select id="theme-select">
+                <option value="auto">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+            </select>
+        </div>
+        <p class="hint">立即生效，不用点「保存」；只存在这台电脑的浏览器里。</p>
+    </section>
+
+    <section>
+        <h2>被控机配置</h2>
+        <div class="field">
+            <label for="profile-select">当前配置</label>
+            <select id="profile-select"></select>
+        </div>
+        <div class="chip-actions">
+            <button id="profile-save-as" type="button">按当前表单另存为…</button>
+            <button id="profile-delete" type="button" class="danger">删除此配置</button>
+        </div>
+        <div class="profile-name-row" id="profile-name-row" hidden>
+            <input id="profile-name" type="text" maxlength="20"
+                   placeholder="给这台被控机起个名字，同名会覆盖">
+            <button id="profile-name-ok" type="button" class="primary">保存</button>
+            <button id="profile-name-cancel" type="button">取消</button>
+        </div>
+        <p class="hint">一台 KVM 接多台机器（或配了切换器）时，把每台的采集设备、分辨率、
+            采音设备、串口和鼠标模式各存一份，在这里或控制页工具栏上一键切换。编码、码率、
+            窄带和波特率与被控机无关，切换时保持不变。配置存在这台电脑的浏览器里。</p>
+        <p class="live" id="profile-status"></p>
+    </section>
 
     <section>
         <h2>画面</h2>
@@ -282,6 +338,7 @@
 </main>
 <script src="serial-ws.js"></script>
 <script src="ch9329.js"></script>
+<script src="profiles.js"></script>
 <script src="settings-page.js"></script>
 </body>
 </html>

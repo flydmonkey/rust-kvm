@@ -186,31 +186,211 @@
         }
     }
 
-    async function save() {
+    async function putConfig(next) {
+        const response = await fetch("/api/config", {
+            method: "PUT",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(next)
+        });
+        if (!response.ok) {
+            throw new Error(await response.text());
+        }
+        config = await response.json();
+    }
+
+    // syncProfile 为 false 给「另存为」用：存成新配置时不能顺手改掉原来那份
+    async function save(syncProfile = true) {
         saveButton.disabled = true;
         saveStatus.textContent = "正在保存…";
         saveStatus.className = "";
         try {
-            const response = await fetch("/api/config", {
-                method: "PUT",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify(collect())
-            });
-            if (!response.ok) {
-                throw new Error(await response.text());
-            }
-            config = await response.json();
+            await putConfig(collect());
             // 不写「采集已重开」：改了设备或分辨率才会重开，只改串口不会，
             // 而这里分不清用户动了哪一项
-            saveStatus.textContent = "已保存（设备或分辨率有变动时采集会自动重开）";
+            let text = "已保存（设备或分辨率有变动时采集会自动重开）";
+            if (syncProfile && profiles.active && storeProfiles(Profiles.updateActive(profiles, config))) {
+                text = `已保存到配置「${profiles.active}」（设备或分辨率有变动时采集会自动重开）`;
+            }
+            saveStatus.textContent = text;
             saveStatus.className = "ok";
+            return true;
         } catch (e) {
             saveStatus.textContent = `保存失败：${e.message || e}`;
             saveStatus.className = "error";
+            return false;
         } finally {
             saveButton.disabled = false;
         }
     }
+
+    // -------------------------------------------------------------------
+    // 被控机配置：存在浏览器里，切换就是合并进当前配置再写回服务端
+    // -------------------------------------------------------------------
+
+    const profileSelect = el("profile-select");
+    const profileDelete = el("profile-delete");
+    const profileNameRow = el("profile-name-row");
+    const profileName = el("profile-name");
+    const profileStatus = el("profile-status");
+    const DELETE_CONFIRM_MS = 3000;
+
+    let profiles = Profiles.load(window.localStorage);
+    let deleteArmedTimer = null;
+
+    function setProfileStatus(text, level) {
+        profileStatus.textContent = text || "";
+        profileStatus.className = `live ${level || ""}`;
+    }
+
+    function storeProfiles(state) {
+        try {
+            profiles = Profiles.save(window.localStorage, state);
+            return true;
+        } catch (e) {
+            setProfileStatus(`浏览器不让存：${e.message || e}`, "error");
+            return false;
+        }
+    }
+
+    function disarmDelete() {
+        clearTimeout(deleteArmedTimer);
+        deleteArmedTimer = null;
+        profileDelete.textContent = "删除此配置";
+    }
+
+    function renderProfiles() {
+        const options = [{
+            value: "",
+            label: profiles.profiles.length ? "（不使用配置）" : "（还没有配置）"
+        }];
+        profiles.profiles.forEach((profile) => {
+            options.push({value: profile.name, label: profile.name});
+        });
+        fill(profileSelect, options);
+        profileSelect.value = profiles.active || "";
+        profileDelete.disabled = !profiles.active;
+        disarmDelete();
+    }
+
+    async function switchProfile() {
+        const name = profileSelect.value;
+        if (!name) {
+            storeProfiles(Object.assign({}, profiles, {active: null}));
+            renderProfiles();
+            setProfileStatus("不跟随任何配置了，之后保存不会改动已存的配置", "ok");
+            return;
+        }
+        if (!config) {
+            setProfileStatus("还没读到当前配置，稍后再试", "error");
+            renderProfiles();
+            return;
+        }
+        const result = Profiles.apply(profiles, name, config);
+        if (result.error) {
+            setProfileStatus(result.error, "error");
+            renderProfiles();
+            return;
+        }
+        profileSelect.disabled = true;
+        setProfileStatus(`正在切换到「${name}」…`);
+        try {
+            await putConfig(result.settings);
+            storeProfiles(result.state);
+            renderConfig();
+            setProfileStatus(
+                `已切换到「${name}」。设备或分辨率有变动时画面会自动重开；串口要在控制页重新连接键鼠才换过去`,
+                "ok"
+            );
+        } catch (e) {
+            setProfileStatus(`切换失败：${e.message || e}`, "error");
+        } finally {
+            profileSelect.disabled = false;
+            renderProfiles();
+        }
+    }
+
+    function openNameRow() {
+        profileNameRow.hidden = false;
+        profileName.value = profiles.active || "";
+        profileName.focus();
+        profileName.select();
+    }
+
+    function closeNameRow() {
+        profileNameRow.hidden = true;
+    }
+
+    // 另存为同时把表单保存到服务端：存进配置的应该是真正生效的那份，
+    // 不能是一份没保存过的草稿
+    async function saveAsProfile() {
+        const name = Profiles.normalizeName(profileName.value);
+        if (!name) {
+            setProfileStatus("请给配置起个名字", "error");
+            profileName.focus();
+            return;
+        }
+        if (!(await save(false))) {
+            setProfileStatus("表单没能保存，配置也没有存", "error");
+            return;
+        }
+        const result = Profiles.saveAs(profiles, name, config);
+        if (result.error) {
+            setProfileStatus(result.error, "error");
+            return;
+        }
+        if (storeProfiles(result.state)) {
+            closeNameRow();
+            renderProfiles();
+            setProfileStatus(`已存为配置「${name}」`, "ok");
+        }
+    }
+
+    // 点两下才删：下拉框就在旁边，一不小心就点到了
+    function deleteProfile() {
+        const name = profiles.active;
+        if (!name) {
+            return;
+        }
+        if (!deleteArmedTimer) {
+            profileDelete.textContent = `再点一次删除「${name}」`;
+            deleteArmedTimer = setTimeout(disarmDelete, DELETE_CONFIRM_MS);
+            return;
+        }
+        if (storeProfiles(Profiles.remove(profiles, name))) {
+            setProfileStatus(`已删除配置「${name}」，当前设置不变`, "ok");
+        }
+        renderProfiles();
+    }
+
+    profileSelect.addEventListener("change", switchProfile);
+    el("profile-save-as").addEventListener("click", openNameRow);
+    el("profile-name-ok").addEventListener("click", saveAsProfile);
+    el("profile-name-cancel").addEventListener("click", closeNameRow);
+    profileName.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            saveAsProfile();
+        } else if (event.key === "Escape") {
+            closeNameRow();
+        }
+    });
+    profileDelete.addEventListener("click", deleteProfile);
+    // 控制页那边切了配置，这边的下拉框跟着变
+    window.addEventListener("storage", (event) => {
+        if (event.key === Profiles.STORAGE_KEY || event.key === null) {
+            profiles = Profiles.load(window.localStorage);
+            renderProfiles();
+        }
+    });
+    renderProfiles();
+
+    const themeSelect = el("theme-select");
+    themeSelect.value = Theme.current();
+    themeSelect.addEventListener("change", () => Theme.set(themeSelect.value));
+    window.addEventListener("storage", (event) => {
+        if (event.key === Theme.STORAGE_KEY || event.key === null) {
+            themeSelect.value = Theme.current();
+        }
+    });
 
     // 显示实际生效的值。请求的分辨率不一定拿得到——服务端按「最接近」协商，
     // 所以这一行才是真相，也是判断带宽够不够的依据。
@@ -435,15 +615,7 @@
     async function patchConfig(mutate) {
         const next = JSON.parse(JSON.stringify(config));
         mutate(next);
-        const response = await fetch("/api/config", {
-            method: "PUT",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify(next)
-        });
-        if (!response.ok) {
-            throw new Error(await response.text());
-        }
-        config = await response.json();
+        await putConfig(next);
     }
 
     fill(videoSize, SIZES.map(([w, h]) => ({value: `${w}x${h}`, label: `${w} × ${h}`})));
@@ -456,7 +628,7 @@
     fill(serialBaud, BAUD_RATES.map((rate) => ({value: String(rate), label: String(rate)})));
 
     videoCodec.addEventListener("change", renderBitrateState);
-    saveButton.addEventListener("click", save);
+    saveButton.addEventListener("click", () => save());
     reloadButton.addEventListener("click", load);
     el("chip-read").addEventListener("click", readChip);
     el("chip-baud").addEventListener("click", writeBaudRate);

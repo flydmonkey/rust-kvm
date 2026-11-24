@@ -44,6 +44,18 @@ self.onmessage = (event) => {
         tapping = message.on;
         return;
     }
+    // 文字识别要一张当前画面。不能等下一帧：MJPEG 画面静止时服务端一帧都不发。
+    // createImageBitmap 是复制；transferToImageBitmap 会把显示中的画布清空
+    if (message.type === "snapshot") {
+        const reply = (bitmap) => self.postMessage({type: "snapshot", id: message.id, bitmap: bitmap},
+            bitmap ? [bitmap] : []);
+        if (!canvas || !canvas.width || !canvas.height) {
+            reply(null);
+            return;
+        }
+        createImageBitmap(canvas).then(reply, () => reply(null));
+        return;
+    }
     if (message.type !== "init") {
         return;
     }

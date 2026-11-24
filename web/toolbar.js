@@ -1,7 +1,7 @@
-// 左侧浮动工具栏：全屏（连带 Keyboard Lock）、录制、Ctrl+Alt+Del、粘贴、
-// 松开所有键、设置、刷新。布局照搬 chrome-kvm。
+// 左侧浮动工具栏：全屏（连带 Keyboard Lock）、录制、粘贴、松开所有键、设置、刷新。
+// 布局照搬 chrome-kvm。识别文字和快捷键（Ctrl+Alt+Del 在里面）各有自己的文件。
 //
-// 键鼠相关的三个都只是调 KvmInput 暴露出来的动作——协议层在 ch9329.js 里早就
+// 键鼠相关的两个都只是调 KvmInput 暴露出来的动作——协议层在 ch9329.js 里早就
 // 齐了（和 chrome-kvm 逐字节相同），这个文件只负责按钮、图标和文案。
 (function () {
     const toolbarEl = document.getElementById("toolbar");
@@ -12,7 +12,6 @@
     const recordIcon = document.getElementById("icon-record");
     const stopIcon = document.getElementById("icon-stop");
     const pasteButton = document.getElementById("paste");
-    const cadButton = document.getElementById("ctrl-alt-del");
     const releaseButton = document.getElementById("release-all");
     const settingsButton = document.getElementById("open-settings");
     const reloadButton = document.getElementById("reload");
@@ -35,6 +34,23 @@
             toastEl.textContent = "";
         }, level === "error" ? TOAST_ERROR_MS : TOAST_MS);
     }
+
+    // 快捷键面板也要往这条提示里报结果
+    window.KvmToast = toast;
+
+    // 工具栏旁的面板同一时刻只开一个。面板用 data-toggle 指向打开它的按钮
+    window.KvmClosePanels = function (except) {
+        document.querySelectorAll(".tool-panel").forEach((panel) => {
+            if (panel === except) {
+                return;
+            }
+            panel.hidden = true;
+            const toggle = document.getElementById(panel.dataset.toggle);
+            if (toggle) {
+                toggle.classList.remove("active");
+            }
+        });
+    };
 
     // ---------------------------------------------------------------------
     // 全屏 + Keyboard Lock
@@ -215,18 +231,6 @@
         toast("键鼠还没连上。先点上面那个键盘图标连接", "error");
         return false;
     }
-
-    cadButton.addEventListener("click", async () => {
-        if (!ready()) {
-            return;
-        }
-        try {
-            await KvmInput.ctrlAltDel();
-            toast("已发送 Ctrl+Alt+Del", "ok");
-        } catch (e) {
-            toast(`发送失败：${e.message}`, "error");
-        }
-    });
 
     releaseButton.addEventListener("click", () => {
         if (!ready()) {

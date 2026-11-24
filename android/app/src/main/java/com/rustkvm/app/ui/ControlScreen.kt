@@ -50,6 +50,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextRange
@@ -60,7 +61,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.rustkvm.app.data.CustomShortcutsStore
 import com.rustkvm.app.ui.components.ExtraKeysBar
+import com.rustkvm.app.ui.components.ShortcutSheet
 import com.rustkvm.app.ui.input.KEYBOARD_SENTINEL
 import com.rustkvm.app.ui.input.KeyboardEdit
 import com.rustkvm.app.ui.input.NormalizedTouch
@@ -73,8 +76,12 @@ import com.rustkvm.app.ui.components.AudioToggle
 import com.rustkvm.client.audio.PcmPlayer
 import com.rustkvm.client.audio.trimAudioBacklog
 import com.rustkvm.client.hid.ControlBusy
+import com.rustkvm.client.hid.RepeatEnd
 import com.rustkvm.client.hid.SerialControl
 import com.rustkvm.client.hid.SerialControlFailure
+import com.rustkvm.client.hid.Shortcuts
+import com.rustkvm.client.hid.repeatShortcutSteps
+import com.rustkvm.client.hid.sendShortcutSteps
 import com.rustkvm.client.net.CertDecision
 import com.rustkvm.client.net.KvmHttpClient
 import com.rustkvm.client.net.KvmSession
@@ -87,7 +94,9 @@ import com.rustkvm.protocol.KvmConfig
 import com.rustkvm.protocol.parseAudioError
 import com.rustkvm.protocol.parseAudioText
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
@@ -130,6 +139,22 @@ fun ControlScreen(
     val imeVisible = WindowInsets.isImeVisible
     val clipboard = LocalClipboardManager.current
     val uiScope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val shortcutsStore = remember(context) { CustomShortcutsStore(context.applicationContext) }
+    var customShortcuts by remember { mutableStateOf(shortcutsStore.get()) }
+    var showShortcuts by remember(baseUrl) { mutableStateOf(false) }
+    var repeatEnabled by remember(baseUrl) { mutableStateOf(false) }
+    var repeatJob by remember(baseUrl) { mutableStateOf<Job?>(null) }
+    var repeatText by remember(baseUrl) { mutableStateOf("") }
+    var repeatCount by remember(baseUrl) { mutableStateOf(0) }
+    var pasting by remember(baseUrl) { mutableStateOf(false) }
+    var shortcutNotice by remember(baseUrl) { mutableStateOf<String?>(null) }
+    LaunchedEffect(shortcutNotice) {
+        if (shortcutNotice != null) {
+            delay(SHORTCUT_NOTICE_MS)
+            shortcutNotice = null
+        }
+    }
     SideEffect { pcmPlayer.muted = muted }
     DisposableEffect(pcmPlayer) {
         onDispose { pcmPlayer.close() }
@@ -198,12 +223,76 @@ fun ControlScreen(
         }
     }
 
+    fun stopRepeat() {
+        val job = repeatJob ?: return
+        repeatJob = null
+        job.cancel()
+        shortcutNotice = "已停止连按，共按了 $repeatCount 次 $repeatText"
+    }
+
+    fun startRepeat(control: SerialControl<KvmSession>, sequence: Shortcuts.Sequence) {
+        repeatText = sequence.text
+        repeatCount = 0
+        lateinit var job: Job
+        job = uiScope.launch(start = CoroutineStart.LAZY) {
+            val end = repeatShortcutSteps(sequence.steps, onCount = { repeatCount = it }) { codes ->
+                // 重连后串口对象换了，接着往新连接上连按不是任何人想要的
+                serialControl === control && runCatching { control.tapCombo(codes) }.getOrDefault(false)
+            }
+            if (repeatJob !== job) return@launch
+            repeatJob = null
+            shortcutNotice = when (end) {
+                RepeatEnd.TimedOut ->
+                    "连按已到 ${Shortcuts.REPEAT_MAX_MS / 1000} 秒上限，自动停止，共按了 $repeatCount 次 $repeatText"
+                RepeatEnd.Failed -> "快捷键没有发完：$repeatText"
+            }
+        }
+        repeatJob = job
+        job.start()
+    }
+
+    fun runShortcut(combo: String) {
+        // 连按时点任何快捷键都是想停下来，不管点的是哪个
+        if (repeatJob != null) {
+            stopRepeat()
+            return
+        }
+        val control = serialControl
+        if (control == null || state != ControlState.Streaming) {
+            shortcutNotice = "键鼠还没连上"
+            return
+        }
+        if (pasting) {
+            shortcutNotice = "正在粘贴，等粘贴结束或取消后再按快捷键"
+            return
+        }
+        when (val parsed = Shortcuts.parseSequence(combo)) {
+            is Shortcuts.Parsed.Invalid -> shortcutNotice = "快捷键无效：${parsed.message}"
+            is Shortcuts.Parsed.Ok ->
+                if (repeatEnabled) {
+                    startRepeat(control, parsed.value)
+                } else {
+                    keyInputs.trySend(KeyInput.Combo(parsed.value))
+                }
+        }
+    }
+
     // 软键盘和功能键栏的按键必须按顺序逐个敲完：并发敲的话按键会交错
     LaunchedEffect(keyInputs) {
         for (input in keyInputs) {
             val control = serialControl ?: continue
+            // 粘贴和开机连按都在一包一包地模拟敲键，这期间别的按键插进来会互相覆盖
+            if ((pasting || repeatJob != null) && input !is KeyInput.Combo) continue
             try {
                 when (input) {
+                    is KeyInput.Combo -> {
+                        val sent = sendShortcutSteps(input.sequence.steps) { control.tapCombo(it) }
+                        shortcutNotice = if (sent) {
+                            "已发送 ${input.sequence.text}"
+                        } else {
+                            "快捷键没有发完：${input.sequence.text}"
+                        }
+                    }
                     is KeyInput.Tap -> control.tapKey(input.key, input.modifiers)
                     is KeyInput.Typed -> {
                         // 锁定的修饰键只作用于第一个键
@@ -355,7 +444,10 @@ fun ControlScreen(
                 val key = event.nativeKeyEvent.toCh9329Key() ?: return@onPreviewKeyEvent false
                 runCatching {
                     when (event.nativeKeyEvent.action) {
-                        AndroidKeyEvent.ACTION_DOWN -> serialControl?.keydown(key)
+                        // 抬起照常转发：屏蔽前按下的键要是松开也被吞掉，本地状态就一直记着它按着
+                        AndroidKeyEvent.ACTION_DOWN -> if (!pasting && repeatJob == null) {
+                            serialControl?.keydown(key)
+                        }
                         AndroidKeyEvent.ACTION_UP -> serialControl?.keyup(key)
                     }
                 }.onFailure { state = ControlState.Failed(it.message ?: "键盘输入发送失败") }
@@ -445,12 +537,20 @@ fun ControlScreen(
             }) {
                 Text("Ctrl+Alt+Del")
             }
+            TextButton(onClick = { showShortcuts = true }) {
+                Text(if (repeatJob != null) "快捷键（连按中）" else "快捷键")
+            }
             TextButton(onClick = {
                 val text = clipboard.getText()?.text.orEmpty()
-                if (text.isNotEmpty()) {
+                if (text.isNotEmpty() && !pasting && repeatJob == null) {
+                    pasting = true
                     uiScope.launch {
-                        runCatching { serialControl?.pasteText(text) }
-                            .onFailure { state = ControlState.Failed(it.message ?: "粘贴失败") }
+                        try {
+                            runCatching { serialControl?.pasteText(text) }
+                                .onFailure { state = ControlState.Failed(it.message ?: "粘贴失败") }
+                        } finally {
+                            pasting = false
+                        }
                     }
                 }
             }) {
@@ -484,6 +584,21 @@ fun ControlScreen(
                         .padding(horizontal = 12.dp, vertical = 6.dp),
                 )
             }
+            val shortcutStatus = if (repeatJob != null) {
+                "正在连按 $repeatText（已按 $repeatCount 次），被控端开机自检时会认到"
+            } else {
+                shortcutNotice
+            }
+            shortcutStatus?.let { message ->
+                Text(
+                    text = message,
+                    color = Color.White,
+                    modifier = Modifier
+                        .padding(8.dp)
+                        .background(Color.Black.copy(alpha = 0.7f))
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+            }
             listOfNotNull(videoNotice, decodeProblem, audioError?.let { "音频不可用：$it" }).forEach { message ->
                 Text(
                     text = message,
@@ -506,6 +621,38 @@ fun ControlScreen(
                 )
             }
         }
+    }
+
+    if (showShortcuts) {
+        ShortcutSheet(
+            custom = customShortcuts,
+            repeatEnabled = repeatEnabled,
+            onRepeatEnabledChange = { enabled ->
+                repeatEnabled = enabled
+                // 关掉连按开关等于叫停
+                if (!enabled) stopRepeat()
+            },
+            repeating = repeatJob != null,
+            onStopRepeat = ::stopRepeat,
+            onRun = { item ->
+                runShortcut(item.combo)
+                // 普通快捷键发完要看画面上的反应，面板挡着就看不见；连按时留着面板好随时停
+                if (repeatJob == null) showShortcuts = false
+            },
+            onAdd = { label, combo ->
+                when (val custom = Shortcuts.makeCustom(label, combo)) {
+                    is Shortcuts.Parsed.Invalid -> custom.message
+                    is Shortcuts.Parsed.Ok -> {
+                        customShortcuts = shortcutsStore.set(customShortcuts + custom.value)
+                        null
+                    }
+                }
+            },
+            onDelete = { index ->
+                customShortcuts = shortcutsStore.set(customShortcuts.filterIndexed { i, _ -> i != index })
+            },
+            onDismiss = { showShortcuts = false },
+        )
     }
 
     serialBusy?.let { busy ->
@@ -640,6 +787,7 @@ private fun AndroidKeyEvent.toCh9329Key(): String? = when (keyCode) {
 private sealed interface KeyInput {
     data class Typed(val edit: KeyboardEdit, val modifiers: Set<String>) : KeyInput
     data class Tap(val key: String, val modifiers: Set<String>) : KeyInput
+    data class Combo(val sequence: Shortcuts.Sequence) : KeyInput
 }
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
@@ -650,6 +798,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 
 private const val DEFAULT_VIDEO_WIDTH = 1920
 private const val DEFAULT_VIDEO_HEIGHT = 1080
+private const val SHORTCUT_NOTICE_MS = 4_000L
 
 private sealed interface ControlState {
     data object Connecting : ControlState

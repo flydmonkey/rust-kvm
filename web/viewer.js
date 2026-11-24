@@ -140,6 +140,8 @@ async function pollServerStats() {
 const recordCanvas = document.createElement("canvas");
 const recordContext = recordCanvas.getContext("2d", {alpha: false});
 let recordTrack = null;
+const snapshotWaiters = new Map();
+let snapshotSeq = 0;
 
 function onRecordFrame(bitmap) {
     if (recordCanvas.width !== bitmap.width || recordCanvas.height !== bitmap.height) {
@@ -167,6 +169,16 @@ async function start() {
         const message = event.data;
         if (message.type === "frame") {
             onRecordFrame(message.bitmap);
+            return;
+        }
+        if (message.type === "snapshot") {
+            const resolve = snapshotWaiters.get(message.id);
+            snapshotWaiters.delete(message.id);
+            if (resolve) {
+                resolve(message.bitmap);
+            } else if (message.bitmap) {
+                message.bitmap.close();
+            }
             return;
         }
         if (message.type === "stats") {
@@ -200,7 +212,17 @@ async function start() {
             recordTrack = null;
         },
         // 有没有画面可录。不看画布（它在开录前根本没收到过帧），看帧是不是在流
-        streaming: () => !!clientStats && clientStats.drawn > 0
+        streaming: () => !!clientStats && clientStats.drawn > 0,
+        // 画面上现在显示的那一帧，ImageBitmap，没有画面时是 null。用完要 close()
+        snapshot() {
+            const id = ++snapshotSeq;
+            return new Promise((resolve) => {
+                snapshotWaiters.set(id, resolve);
+                worker.postMessage({type: "snapshot", id: id});
+            });
+        },
+        // 显示中的画布元素，框选时按它的位置把屏幕坐标换算成画面像素
+        element: canvas
     };
 
     worker.postMessage(

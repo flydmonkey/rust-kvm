@@ -20,6 +20,7 @@ object Ch9329Maps {
                 "ArrowDown" to 0x51, "Down" to 0x51,
                 "PrintScreen" to 0x46, "Insert" to 0x49, "Delete" to 0x4C,
                 "ContextMenu" to 0x65, "NumLock" to 0x53,
+                "ScrollLock" to 0x47, "NumpadEnter" to 0x58,
                 "NumpadMultiply" to 0x55, "NumpadAdd" to 0x57,
                 "NumpadSubtract" to 0x56, "NumpadDecimal" to 0x63,
                 "NumpadDivide" to 0x54,
