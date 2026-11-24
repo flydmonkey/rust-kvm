@@ -302,27 +302,6 @@
     </section>
 
     <section>
-        <h2>ATX 电源</h2>
-        <div class="field">
-            <label for="atx-port">继电器串口</label>
-            <select id="atx-port"></select>
-        </div>
-        <div class="field">
-            <label for="atx-channel">电源键通道</label>
-            <select id="atx-channel"></select>
-        </div>
-        <div class="field">
-            <label for="atx-reset">复位键通道</label>
-            <select id="atx-reset"></select>
-        </div>
-        <p class="hint">LCUS 系列 USB 串口继电器插在<strong>宿主机</strong>上，触点并在主板前面板
-            的电源键（<code>PWR_SW</code>）跳线上，控制页就能远程开机、关机、长按强制断电。
-            两路以上的继电器可以再接复位键（<code>RESET</code>）。接线方法见 README「ATX 电源」。</p>
-        <p class="hint">继电器和 CH9329 多半都叫 CH340，认 COM 口号：先在这里看一眼列表，
-            插上继电器后多出来的那个就是它。选好点「保存」，控制页工具栏会出现电源按钮。</p>
-    </section>
-
-    <section>
         <h2>CH9329 芯片</h2>
         <p class="hint">这一节直接读写芯片，要临时借用串口——别处正连着时会问你要不要
             接管。<strong>写入后都要把 CH9329 断电重插（拔掉 USB 再插回）才生效。</strong></p>
@@ -349,6 +328,27 @@
             <button id="chip-reset" type="button" class="danger">恢复出厂配置</button>
         </div>
         <p class="live" id="chip-status">还没读过芯片</p>
+    </section>
+
+    <section>
+        <h2>ATX 电源</h2>
+        <div class="field">
+            <label for="atx-port">继电器串口</label>
+            <select id="atx-port"></select>
+        </div>
+        <div class="field">
+            <label for="atx-channel">电源键通道</label>
+            <select id="atx-channel"></select>
+        </div>
+        <div class="field">
+            <label for="atx-reset">复位键通道</label>
+            <select id="atx-reset"></select>
+        </div>
+        <p class="hint">LCUS 系列 USB 串口继电器插在<strong>宿主机</strong>上，触点并在主板前面板
+            的电源键（<code>PWR_SW</code>）跳线上，控制页就能远程开机、关机、长按强制断电。
+            两路以上的继电器可以再接复位键（<code>RESET</code>）。接线方法见 README「ATX 电源」。</p>
+        <p class="hint">继电器和 CH9329 多半都叫 CH340，认 COM 口号：先在这里看一眼列表，
+            插上继电器后多出来的那个就是它。选好点「保存」，控制页工具栏会出现电源按钮。</p>
     </section>
 
     <div class="actions">
