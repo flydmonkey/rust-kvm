@@ -20,13 +20,16 @@
             justify-content: center;
         }
 
-        /* 画面按原始比例缩放到窗口内。用 max-* 而不是 object-fit，
-           后者在 canvas 上的支持不如前者稳。顺带一个好处：画布元素的
-           布局框正好等于画面内容框，ch9329.js 的绝对坐标换算不用改。 */
+        /* 尺寸和位置由 view-panel.js 按显示方式算好直接写上。不用 object-fit，
+           它在 canvas 上的支持不稳；直接算框还有个好处：画布元素的布局框正好
+           等于画面内容框，ch9329.js 的绝对坐标换算不用改。 */
         #screen {
             display: block;
-            max-width: 100%;
-            max-height: 100%;
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
         }
 
         .overlay {
@@ -140,6 +143,35 @@
 
         .status-indicator.status-error {
             color: var(--error);
+        }
+
+        /* 键盘指示灯：Num / Caps / Scroll 三颗小灯，亮的那颗是绿底 */
+        .lock-lights {
+            display: flex;
+            gap: 2px;
+            padding: 1px 0 3px;
+        }
+
+        .lock-lights[hidden] {
+            display: none;
+        }
+
+        .floating-toolbar .lock-light {
+            width: 12px;
+            height: 18px;
+            border-radius: 4px;
+            background-color: var(--tint-06);
+            color: var(--text-faint);
+            font: 600 10px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+
+        .floating-toolbar .lock-light:hover {
+            background-color: var(--tint-15);
+        }
+
+        .floating-toolbar .lock-light[aria-pressed="true"] {
+            background-color: var(--ok);
+            color: var(--on-primary);
         }
 
         /* 功能分组之间的细分隔线 */
@@ -459,6 +491,7 @@
             color: var(--accent);
         }
 
+        #view-close,
         #atx-close,
         #profile-close,
         #shortcut-close,
@@ -471,6 +504,7 @@
             border-radius: 6px;
         }
 
+        #view-close:hover,
         #atx-close:hover,
         #profile-close:hover,
         #shortcut-close:hover,
@@ -643,6 +677,7 @@
         </svg>
         <span class="tooltip" id="input-status-tip">未连接串口</span>
     </button>
+    <div class="lock-lights" id="lock-lights" role="group" aria-label="键盘指示灯" hidden></div>
     <button id="audio-toggle" class="status-indicator status-idle" type="button" aria-label="声音">
         <svg id="icon-audio-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -686,6 +721,26 @@
             <path d="M16 21v-3a2 2 0 0 1 2-2h3"/>
         </svg>
         <span class="tooltip" id="fullscreen-tip">全屏</span>
+    </button>
+    <button id="view-mode" type="button" aria-label="显示方式">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"/>
+            <path d="M21 21l-4.35-4.35"/>
+            <path d="M11 8v6"/>
+            <path d="M8 11h6"/>
+        </svg>
+        <span class="tooltip" id="view-mode-tip">显示方式</span>
+    </button>
+    <button id="screenshot" type="button" aria-label="截图">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+            <circle cx="12" cy="13" r="4"/>
+        </svg>
+        <span class="tooltip">截图
+按采集卡原始分辨率保存 PNG
+并复制到剪贴板</span>
     </button>
     <button id="record" type="button" aria-label="录制">
         <svg id="icon-record" viewBox="0 0 24 24" aria-hidden="true">
@@ -804,6 +859,15 @@ Win+L、Alt+Tab、BIOS 热键等
     </button>
 </div>
 
+<div id="view-panel" class="tool-panel" data-toggle="view-mode" hidden>
+    <div class="tool-panel-header">
+        <span>显示方式</span>
+        <button id="view-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div id="view-options" class="profile-list"></div>
+    <p class="shortcut-hint">放大时画面跟着鼠标走，指针下面就是被控端的那一点。</p>
+</div>
+
 <div id="atx-panel" class="tool-panel" data-toggle="atx" hidden>
     <div class="tool-panel-header">
         <span>ATX 电源</span>
@@ -875,10 +939,12 @@ Win+L、Alt+Tab、BIOS 热键等
 <script src="ch9329.js"></script>
 <script src="status-text.js"></script>
 <script src="serial-ws.js"></script>
+<script src="view-modes.js"></script>
 <script src="viewer.js"></script>
 <script src="input.js"></script>
 <script src="audio.js"></script>
 <script src="toolbar.js"></script>
+<script src="view-panel.js"></script>
 <script src="shortcuts.js"></script>
 <script src="shortcut-panel.js"></script>
 <script src="ocr.js"></script>

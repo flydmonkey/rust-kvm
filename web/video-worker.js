@@ -230,12 +230,20 @@ function isKeyFrame(bytes) {
     return false;
 }
 
+// 主线程那块画布已经移交过来，它读不到这边改的尺寸，显示方式却要按画面尺寸摆，
+// 所以改了就告诉它一声
+function fitCanvas(width, height) {
+    if (canvas.width === width && canvas.height === height) {
+        return;
+    }
+    canvas.width = width;
+    canvas.height = height;
+    self.postMessage({type: "size", width: width, height: height});
+}
+
 function drawFrame(frame) {
     try {
-        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-            canvas.width = frame.displayWidth;
-            canvas.height = frame.displayHeight;
-        }
+        fitCanvas(frame.displayWidth, frame.displayHeight);
         context.drawImage(frame, 0, 0);
         window_.drawn += 1;
         // 「到帧→绘制」两种编码同一个含义，可以直接做差比较。
@@ -272,10 +280,7 @@ async function pump() {
 
     try {
         const bitmap = await createImageBitmap(new Blob([frame.buffer], {type: "image/jpeg"}));
-        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-            canvas.width = bitmap.width;
-            canvas.height = bitmap.height;
-        }
+        fitCanvas(bitmap.width, bitmap.height);
         context.drawImage(bitmap, 0, 0);
         // drawImage 是同步的，画完之后像素已经在画布里了，所以这时把 bitmap
         // 转移出去是安全的——转移会让这边的引用失效，但我们已经不需要它了。

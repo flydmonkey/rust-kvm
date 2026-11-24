@@ -157,10 +157,19 @@ function onRecordFrame(bitmap) {
     }
 }
 
+// 画面的像素尺寸。画布移交之后读它的 width/height 不会跟着 Worker 变，以 Worker 报的为准
+let videoSize = null;
+
+function setVideoSize(width, height) {
+    videoSize = {width: width, height: height};
+    window.dispatchEvent(new Event("kvm-video-resize"));
+}
+
 async function start() {
     const size = await detectResolution();
     canvas.width = size.width;
     canvas.height = size.height;
+    setVideoSize(size.width, size.height);
 
     const offscreen = canvas.transferControlToOffscreen();
     const worker = new Worker("video-worker.js");
@@ -179,6 +188,10 @@ async function start() {
             } else if (message.bitmap) {
                 message.bitmap.close();
             }
+            return;
+        }
+        if (message.type === "size") {
+            setVideoSize(message.width, message.height);
             return;
         }
         if (message.type === "stats") {
@@ -222,8 +235,11 @@ async function start() {
             });
         },
         // 显示中的画布元素，框选时按它的位置把屏幕坐标换算成画面像素
-        element: canvas
+        element: canvas,
+        // 画面像素尺寸 {width, height}，变了会发 kvm-video-resize
+        size: () => videoSize
     };
+    window.dispatchEvent(new Event("kvm-video-resize"));
 
     worker.postMessage(
         {type: "init", canvas: offscreen, url: websocketUrl("/ws/video")},

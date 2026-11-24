@@ -131,6 +131,7 @@
         }
         StatusText.applyStatus(statusButton, statusTip, {level: level, lines: lines});
         statusButton.setAttribute("aria-label", label());
+        renderLockLights();
     }
 
     function label() {
@@ -421,6 +422,104 @@
         chipInfo = await query(() => ch.getInfo());
         renderStatus();
     }
+
+    // ---------------------------------------------------------------------
+    // 键盘指示灯
+    // ---------------------------------------------------------------------
+
+    // 芯片只在被问到时才报灯的状态，所以定时问一下：被控端开机自检、登录界面会
+    // 自己改 Num Lock，光凭本机按过什么键推算不准
+    const LOCK_POLL_MS = 2000;
+    // 问的那一下要临时开回应答等待，这期间的键鼠包都得等确认，鼠标会顿一下。
+    // 所以最近有操作就跳过这一轮；按锁定键、点小灯之后的那次补查不受限
+    const LOCK_POLL_IDLE_MS = 500;
+    const lockGroup = document.getElementById("lock-lights");
+    let lastInputAt = 0;
+    let lockPollBusy = false;
+    // 偶尔漏一次应答很常见，连着两次都没回才算无应答，免得图标闪红
+    let lockPollMisses = 0;
+
+    function renderLockLights() {
+        const lights = ch && !serialLost ? StatusText.lockLights(chipInfo) : null;
+        lockGroup.hidden = !lights;
+        if (!lights) {
+            return;
+        }
+        // 只建一次，之后只改状态：每次重建的话鼠标停在灯上时提示会一闪一闪
+        if (!lockGroup.children.length) {
+            StatusText.LOCK_LIGHTS.forEach((light) => {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "lock-light";
+                button.textContent = light.glyph;
+                const tip = document.createElement("span");
+                tip.className = "tooltip";
+                button.appendChild(tip);
+                button.addEventListener("click", () => toggleLock(light.key));
+                lockGroup.appendChild(button);
+            });
+        }
+        lights.forEach((light, index) => {
+            const button = lockGroup.children[index];
+            button.setAttribute("aria-pressed", String(light.on));
+            button.setAttribute("aria-label", light.label);
+            button.querySelector(".tooltip").textContent = light.label;
+        });
+    }
+
+    async function pollLockLights(force) {
+        if (lockPollBusy || !ch || serialLost || connecting || document.hidden || keysSuppressed()) {
+            return;
+        }
+        if (force !== true && Date.now() - lastInputAt < LOCK_POLL_IDLE_MS) {
+            return;
+        }
+        lockPollBusy = true;
+        try {
+            const info = await query(() => ch.getInfo());
+            if (info) {
+                lockPollMisses = 0;
+                chipInfo = info;
+            } else if (++lockPollMisses >= 2) {
+                chipInfo = null;
+            }
+            renderStatus();
+        } catch (e) {
+            // 串口断了由断线那条路处理，这里不用管
+        } finally {
+            lockPollBusy = false;
+        }
+    }
+
+    // 被控端收到按键后才改灯，稍等一下再问
+    function pollLockLightsSoon() {
+        setTimeout(() => pollLockLights(true), 150);
+    }
+
+    async function toggleLock(key) {
+        if (!ch || serialLost || keysSuppressed()) {
+            return;
+        }
+        await ch.tapCombo([key]);
+        pollLockLightsSoon();
+    }
+
+    setInterval(pollLockLights, LOCK_POLL_MS);
+    document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+            pollLockLights();
+        }
+    });
+    ["keydown", "mousemove", "mousedown", "wheel"].forEach((type) => {
+        document.addEventListener(type, () => {
+            lastInputAt = Date.now();
+        }, {capture: true, passive: true});
+    });
+    document.addEventListener("keyup", (event) => {
+        if (StatusText.LOCK_LIGHTS.some((light) => light.key === event.code) && !isEditableTarget(event.target)) {
+            pollLockLightsSoon();
+        }
+    });
 
     // ---------------------------------------------------------------------
     // 指针锁定

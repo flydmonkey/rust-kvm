@@ -148,8 +148,8 @@ var StatusText = (function () {
         return {label: "退出全屏", lines: full};
     }
 
-    // 录像文件名用本地时间，方便对着操作时间找文件
-    function recordFileName(date) {
+    // 文件名用本地时间，方便对着操作时间找文件
+    function timestamp(date) {
         var at = date || new Date();
         var pad = function (value) {
             return String(value).padStart(2, "0");
@@ -161,8 +161,38 @@ var StatusText = (function () {
             + "-"
             + pad(at.getHours())
             + pad(at.getMinutes())
-            + pad(at.getSeconds())
-            + ".webm";
+            + pad(at.getSeconds());
+    }
+
+    function recordFileName(date) {
+        return timestamp(date) + ".webm";
+    }
+
+    function screenshotFileName(date) {
+        return "screenshot-" + timestamp(date) + ".png";
+    }
+
+    // 键盘指示灯，照搬 chrome-kvm。key 是点灯时发给被控端的键
+    var LOCK_LIGHTS = [
+        {key: "NumLock", field: "numLock", glyph: "1", name: "Num Lock"},
+        {key: "CapsLock", field: "capsLock", glyph: "A", name: "Caps Lock"},
+        {key: "ScrollLock", field: "scrollLock", glyph: "⇩", name: "Scroll Lock"}
+    ];
+
+    // 被控端没枚举出这块键盘时灯的状态没有意义，返回 null 让页面把灯藏起来
+    function lockLights(info) {
+        if (!info || !info.usbConnected) {
+            return null;
+        }
+        return LOCK_LIGHTS.map(function (light) {
+            var on = !!info[light.field];
+            return {
+                key: light.key,
+                glyph: light.glyph,
+                on: on,
+                label: light.name + (on ? " 开，点击切换" : " 关，点击切换")
+            };
+        });
     }
 
     return {
@@ -170,7 +200,10 @@ var StatusText = (function () {
         describeSerial: describeSerial,
         describeFullscreen: describeFullscreen,
         applyStatus: applyStatus,
-        recordFileName: recordFileName
+        recordFileName: recordFileName,
+        screenshotFileName: screenshotFileName,
+        LOCK_LIGHTS: LOCK_LIGHTS,
+        lockLights: lockLights
     };
 })();
 
