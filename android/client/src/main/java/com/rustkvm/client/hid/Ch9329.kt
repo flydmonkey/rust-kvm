@@ -123,6 +123,43 @@ class Ch9329(
         syncKeyboard()
     }
 
+    /**
+     * 按一下组合键再全部松开，[codes] 是 KeyboardEvent.code 名，和 web/ch9329.js 的 tapCombo 同一套发法：
+     * 有修饰键也有普通键时先单独发一包修饰键——有的系统要先看到 Ctrl/Win 按住，才把随后的键当快捷键。
+     * 有不认识的键或普通键超过 6 个就一包都不发，返回 false。
+     */
+    fun tapCombo(codes: List<String>): Boolean {
+        var modifiers = 0
+        val keys = mutableListOf<Int>()
+        for (code in codes) {
+            val bit = Ch9329Maps.CONTROL_KEY_BITS[code]
+            if (bit != null) {
+                modifiers = modifiers or bit
+                continue
+            }
+            val usage = Ch9329Maps.KEYBOARD_MAP[code] ?: return false
+            if (usage !in keys) keys += usage
+        }
+        if (keys.size > MAX_KEYS) return false
+
+        // 外接键盘按着的键会和组合键混在一起，先清掉本地状态
+        pressedKeys.clear()
+        pressedModifiers.clear()
+        if (modifiers != 0 && keys.isNotEmpty()) {
+            write(keyboardPacket(modifiers, emptyList()))
+        }
+        write(keyboardPacket(modifiers, keys))
+        write(KEYBOARD_RELEASE_PACKET.copyOf())
+        return true
+    }
+
+    private fun keyboardPacket(modifiers: Int, keys: List<Int>): ByteArray {
+        val data = IntArray(8)
+        data[0] = modifiers and 0xFF
+        keys.forEachIndexed { index, usage -> data[index + 2] = usage }
+        return packet(COMMAND_KEYBOARD, data)
+    }
+
     internal fun pressUsage(code: Int, modifierBits: Int) {
         write(
             packet(

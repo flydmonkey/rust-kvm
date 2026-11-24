@@ -2,6 +2,8 @@ package com.rustkvm.client.hid
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class Ch9329Test {
@@ -176,6 +178,62 @@ class Ch9329Test {
             frames.first(),
         )
         assertEquals(0x0C.toByte(), frames.last().last())
+    }
+
+    @Test
+    fun tapComboHoldsModifiersFirstThenAddsKeysThenReleases() {
+        val frames = mutableListOf<ByteArray>()
+
+        assertTrue(Ch9329(true) { frames += it }.tapCombo(listOf("ControlLeft", "AltLeft", "F2")))
+
+        assertEquals(
+            listOf(
+                listOf(0x05, 0, 0, 0, 0, 0, 0, 0),
+                listOf(0x05, 0, 0x3B, 0, 0, 0, 0, 0),
+                listOf(0, 0, 0, 0, 0, 0, 0, 0),
+            ),
+            frames.map { frame -> frame.slice(5..12).map { it.toInt() and 0xFF } },
+        )
+        for (frame in frames) {
+            val sum = frame.dropLast(1).sumOf { it.toInt() and 0xFF } and 0xFF
+            assertEquals(sum, frame.last().toInt() and 0xFF)
+        }
+    }
+
+    @Test
+    fun tapComboSkipsModifierOnlyPacketWhenThereIsNothingElse() {
+        val plain = mutableListOf<ByteArray>()
+        Ch9329(true) { plain += it }.tapCombo(listOf("Delete"))
+        assertEquals(listOf(0x4C, 0), plain.map { it[7].toInt() })
+
+        val winOnly = mutableListOf<ByteArray>()
+        Ch9329(true) { winOnly += it }.tapCombo(listOf("MetaLeft"))
+        assertEquals(listOf(0x08, 0x00), winOnly.map { it[5].toInt() })
+    }
+
+    @Test
+    fun tapComboRefusesUnknownOrTooManyKeysWithoutSending() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(true) { frames += it }
+
+        assertFalse(ch.tapCombo(listOf("ControlLeft", "NoSuchKey")))
+        assertFalse(ch.tapCombo(listOf("KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG")))
+        assertTrue(frames.isEmpty())
+    }
+
+    @Test
+    fun tapComboClearsKeysHeldOnTheExternalKeyboard() {
+        val frames = mutableListOf<ByteArray>()
+        val ch = Ch9329(true) { frames += it }
+        ch.keydown("ShiftLeft")
+        ch.keydown("KeyA")
+
+        ch.tapCombo(listOf("MetaLeft", "KeyL"))
+        frames.clear()
+        ch.keydown("KeyB")
+
+        assertEquals(0x00, frames.single()[5].toInt())
+        assertEquals(listOf(0x05, 0), frames.single().slice(7..8).map { it.toInt() })
     }
 
     private fun bytes(vararg values: Int) = ByteArray(values.size) { values[it].toByte() }
