@@ -37,6 +37,9 @@
     const serialBaud = el("serial-baud");
     const mouseMode = el("mouse-mode");
     const workingMode = el("working-mode");
+    const atxPort = el("atx-port");
+    const atxChannel = el("atx-channel");
+    const atxReset = el("atx-reset");
     const saveButton = el("save");
     const reloadButton = el("reload");
     const saveStatus = el("save-status");
@@ -117,6 +120,26 @@
             }))
         );
         showProblem("serial-problem", devices.serial.error);
+
+        fill(atxPort, [{value: "", label: "不使用"}].concat(
+            devices.serial.items.map((item) => ({
+                value: item.name,
+                label: item.description ? `${item.name} — ${item.description}` : item.name
+            }))
+        ));
+    }
+
+    // 没选继电器时两个通道都没意义；复位键不能和电源键同一路，冲突时退回「不接」
+    function renderAtxState() {
+        const unused = !atxPort.value;
+        atxChannel.disabled = unused;
+        atxReset.disabled = unused;
+        [...atxReset.options].forEach((option) => {
+            option.disabled = option.value !== "" && option.value === atxChannel.value;
+        });
+        if (atxReset.value === atxChannel.value) {
+            atxReset.value = "";
+        }
     }
 
     // 码率只对 H.264 有意义。留着能点但不起作用的控件，比灰掉更让人困惑。
@@ -139,6 +162,15 @@
         selectOrKeep(serialPort, config.serial.port);
         selectOrKeep(serialBaud, String(config.serial.baudRate));
         mouseMode.value = config.serial.mouseMode;
+
+        const atx = Atx.normalize(config.atx);
+        atxPort.value = "";
+        if (atx) {
+            selectOrKeep(atxPort, atx.port);
+        }
+        atxChannel.value = String(atx ? atx.channel : 1);
+        atxReset.value = atx && atx.resetChannel ? String(atx.resetChannel) : "";
+        renderAtxState();
     }
 
     // **每个字段都要列全。** 服务端那边所有字段都是 `serde(default)`，漏掉一个不会
@@ -164,7 +196,12 @@
                 port: serialPort.value,
                 baudRate: Number(serialBaud.value),
                 mouseMode: mouseMode.value
-            }
+            },
+            atx: Atx.normalize({
+                port: atxPort.value,
+                channel: Number(atxChannel.value),
+                resetChannel: atxReset.value ? Number(atxReset.value) : null
+            })
         };
     }
 
@@ -626,6 +663,13 @@
         BITRATES.map((kbps) => ({value: String(kbps), label: `${kbps / 1000} Mbps`}))
     );
     fill(serialBaud, BAUD_RATES.map((rate) => ({value: String(rate), label: String(rate)})));
+
+    fill(atxChannel, Atx.CHANNELS.map((n) => ({value: String(n), label: `第 ${n} 路`})));
+    fill(atxReset, [{value: "", label: "不接复位键"}].concat(
+        Atx.CHANNELS.map((n) => ({value: String(n), label: `第 ${n} 路`}))
+    ));
+    atxPort.addEventListener("change", renderAtxState);
+    atxChannel.addEventListener("change", renderAtxState);
 
     videoCodec.addEventListener("change", renderBitrateState);
     saveButton.addEventListener("click", () => save());

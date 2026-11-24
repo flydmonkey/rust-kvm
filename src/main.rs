@@ -3,6 +3,7 @@
 //! 同一个 HTTPS 端口下按端点分工：`/ws/video` 推画面，`/ws/audio` 推声音，
 //! `/ws/serial` 透传键鼠字节，`/api/*` 读状态与设备，其余路径当静态文件伺服。
 
+mod atx;
 mod audio;
 mod certs;
 mod config;
@@ -26,7 +27,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +36,7 @@ use tokio::sync::watch;
 use tower_http::services::ServeDir;
 use tracing::{debug, info, warn};
 
+use atx::{AtxRelay, PressError, PressKind};
 use audio::{AudioHub, AudioStats};
 use config::{Config, ConfigStore};
 use devices::Devices;
@@ -59,6 +61,7 @@ struct AppState {
     hub: Arc<VideoHub>,
     audio: Arc<AudioHub>,
     serial: Arc<SerialHub>,
+    atx: Arc<AtxRelay>,
     config: Arc<ConfigStore>,
     cert_pem: Arc<Vec<u8>>,
 }
@@ -160,6 +163,7 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         hub: VideoHub::new(settings.video),
         audio: AudioHub::new(settings.audio),
         serial: SerialHub::new(),
+        atx: AtxRelay::new(),
         config: store,
         cert_pem: Arc::new(cert.cert_pem),
     };
@@ -173,6 +177,8 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         .route("/api/serial/ports", get(serial_ports))
         .route("/api/devices", get(list_devices))
         .route("/api/config", get(get_config).put(put_config))
+        .route("/api/atx/press", post(atx_press))
+        .route("/api/atx/release", post(atx_release))
         .route("/cert.crt", get(download_cert))
         .fallback_service(ServeDir::new(root.join("web")))
         .layer(axum::middleware::map_response(no_cache))
@@ -638,8 +644,21 @@ async fn get_config(State(state): State<AppState>) -> Json<Config> {
 /// 所以只改了串口的一次保存不会把画面和声音掐一下。
 async fn put_config(
     State(state): State<AppState>,
-    Json(config): Json<Config>,
+    Json(mut config): Json<Config>,
 ) -> Result<Json<Config>, Response> {
+    config.atx = atx::normalize(config.atx);
+    // 同一个口打不开两次，存进去只会让电源键和键鼠互相抢；更怕的是用户以为接好了
+    if config
+        .atx
+        .as_ref()
+        .is_some_and(|relay| relay.port == config.serial.port)
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "继电器和 CH9329 不能是同一个串口",
+        )
+            .into_response());
+    }
     state.config.save(config.clone()).map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -653,6 +672,37 @@ async fn put_config(
     // 串口不在这儿热切换：口是由浏览器通过 /ws/serial 的 open 打开的，
     // 配置只是给页面一个默认值，下次连接自然生效。
     Ok(Json(config))
+}
+
+#[derive(serde::Deserialize)]
+struct PressRequest {
+    kind: PressKind,
+}
+
+/// 按完才返回，长按要等 6 秒。请求中途断开不影响按压本身，断开指令照样会发
+async fn atx_press(State(state): State<AppState>, Json(request): Json<PressRequest>) -> Response {
+    use axum::http::StatusCode;
+    let Some(settings) = state.config.get().atx else {
+        return (StatusCode::CONFLICT, "没有设置继电器，在设置页「ATX 电源」里选").into_response();
+    };
+    match state.atx.press(&settings, request.kind).await {
+        Ok(released_early) => {
+            Json(serde_json::json!({ "releasedEarly": released_early })).into_response()
+        }
+        Err(PressError::Busy) => {
+            (StatusCode::CONFLICT, "继电器正按着，等这一下结束").into_response()
+        }
+        Err(PressError::NoResetChannel) => {
+            (StatusCode::BAD_REQUEST, "没有设置复位键通道").into_response()
+        }
+        Err(PressError::Failed(error)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response()
+        }
+    }
+}
+
+async fn atx_release(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "released": state.atx.release() }))
 }
 
 /// 方便把证书装进客户端的信任区，装了之后就不用每次点「继续前往」。

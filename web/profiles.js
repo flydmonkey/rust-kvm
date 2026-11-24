@@ -19,6 +19,20 @@ var Profiles = (function () {
         "serial.port",
         "serial.mouseMode"
     ];
+    // 继电器整个对象一起存。配置里没有就清空、不沿用当前值：沿用上一台的继电器，
+    // 按下去断电的就是另一台机器
+    var ATX_FIELD = "atx";
+
+    function snapshotAtx(atx) {
+        if (!atx || typeof atx !== "object" || typeof atx.port !== "string" || !atx.port) {
+            return null;
+        }
+        return {
+            port: atx.port,
+            channel: typeof atx.channel === "number" ? atx.channel : 1,
+            resetChannel: typeof atx.resetChannel === "number" ? atx.resetChannel : null
+        };
+    }
 
     function empty() {
         return {active: null, profiles: []};
@@ -66,6 +80,9 @@ var Profiles = (function () {
                 write(result, path, value);
             }
         });
+        if (settings[ATX_FIELD] !== undefined) {
+            result[ATX_FIELD] = snapshotAtx(settings[ATX_FIELD]);
+        }
         return result;
     }
 
@@ -163,6 +180,7 @@ var Profiles = (function () {
                 write(merged, path, value);
             }
         });
+        merged[ATX_FIELD] = snapshotAtx(saved[ATX_FIELD]);
         next.active = name;
         return {state: next, settings: merged};
     }
@@ -193,6 +211,10 @@ var Profiles = (function () {
         var device = read(settings, "video.device");
         if (device) {
             parts.push(device);
+        }
+        var atx = settings && snapshotAtx(settings[ATX_FIELD]);
+        if (atx) {
+            parts.push("电源 " + atx.port + " 第 " + atx.channel + " 路");
         }
         return parts.join(" · ");
     }

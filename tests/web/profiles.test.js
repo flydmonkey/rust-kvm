@@ -51,10 +51,33 @@ test("apply 合并进当前配置，编码、码率、窄带、波特率保持�
     assert.deepStrictEqual(result.settings, {
         video: {device: "Cam B", width: 1280, height: 720, fps: 25, codec: "h264", bitrateKbps: 4000},
         audio: {device: "Mic B", enabled: true, narrowband: false},
-        serial: {port: "COM7", baudRate: 115200, mouseMode: "relative"}
+        serial: {port: "COM7", baudRate: 115200, mouseMode: "relative"},
+        atx: null
     });
     assert.strictEqual(result.state.active, "办公室");
     assert.strictEqual(current.video.device, "USB Video", "不能改动传入的当前配置");
+});
+
+test("继电器跟着配置走", () => {
+    const relay = {port: "COM9", channel: 2, resetChannel: 3};
+    const state = Profiles.saveAs(Profiles.normalize(null), "A", config({atx: relay})).state;
+    assert.deepStrictEqual(state.profiles[0].settings.atx, relay);
+    const result = Profiles.apply(state, "A", config({atx: null}));
+    assert.deepStrictEqual(result.settings.atx, relay);
+    assert.notStrictEqual(result.settings.atx, relay, "要拷贝，不能共用对象");
+});
+
+test("切到没存继电器的旧配置时清空继电器，不沿用上一台的", () => {
+    const old = {active: null, profiles: [{name: "旧", settings: {serial: {port: "COM3"}}}]};
+    const result = Profiles.apply(old, "旧", config({atx: {port: "COM9", channel: 1, resetChannel: null}}));
+    assert.strictEqual(result.settings.atx, null);
+});
+
+test("summary 带上继电器", () => {
+    assert.strictEqual(
+        Profiles.summary({atx: {port: "COM9", channel: 2, resetChannel: null}}),
+        "绝对 · 电源 COM9 第 2 路"
+    );
 });
 
 test("apply 找不到配置时报错", () => {

@@ -421,10 +421,45 @@
             font-size: 12px;
         }
 
+        .atx-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .atx-actions button {
+            padding: 7px 10px;
+            border: 1px solid var(--tint-10);
+            border-radius: 8px;
+            background: var(--tint-04);
+            text-align: left;
+        }
+
+        .atx-actions button[hidden] {
+            display: none;
+        }
+
+        .atx-actions button:hover:not(:disabled) {
+            background: var(--tint-12);
+        }
+
+        .atx-actions button:disabled {
+            cursor: default;
+            opacity: 0.6;
+        }
+
+        /* 待确认的那一下要显眼：再点一次就断电了 */
+        .atx-actions button.armed,
+        #atx-release {
+            border-color: var(--error);
+            color: var(--error-text);
+        }
+
         .tool-panel a {
             color: var(--accent);
         }
 
+        #atx-close,
         #profile-close,
         #shortcut-close,
         #ocr-close {
@@ -436,6 +471,7 @@
             border-radius: 6px;
         }
 
+        #atx-close:hover,
         #profile-close:hover,
         #shortcut-close:hover,
         #ocr-close:hover {
@@ -716,6 +752,16 @@ Win+L、Alt+Tab、BIOS 热键等
 
     <div class="toolbar-divider"></div>
 
+    <button id="atx" type="button" aria-label="ATX 电源" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2v10"/>
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+        </svg>
+        <span class="tooltip">ATX 电源
+开机、关机、强制断电、重启
+设置页选了继电器才出现</span>
+    </button>
     <button id="profiles" type="button" aria-label="切换被控机" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
              stroke-linejoin="round" aria-hidden="true">
@@ -756,6 +802,22 @@ Win+L、Alt+Tab、BIOS 热键等
         </svg>
         <span class="tooltip" id="collapse-tip">展开</span>
     </button>
+</div>
+
+<div id="atx-panel" class="tool-panel" data-toggle="atx" hidden>
+    <div class="tool-panel-header">
+        <span>ATX 电源</span>
+        <button id="atx-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <p class="shortcut-hint" id="atx-info"></p>
+    <div class="atx-actions">
+        <button id="atx-short" type="button" class="atx-press"></button>
+        <button id="atx-long" type="button" class="atx-press"></button>
+        <button id="atx-reset" type="button" class="atx-press" hidden></button>
+        <button id="atx-release" type="button" hidden>松开</button>
+    </div>
+    <p class="shortcut-hint">短按开机，或让系统正常关机；长按 6 秒强制断电。长按和复位会丢未保存的
+        数据，要连点两下。</p>
 </div>
 
 <div id="profile-panel" class="tool-panel" data-toggle="profiles" hidden>
@@ -823,5 +885,7 @@ Win+L、Alt+Tab、BIOS 热键等
 <script src="ocr-panel.js"></script>
 <script src="profiles.js"></script>
 <script src="profile-panel.js"></script>
+<script src="atx.js"></script>
+<script src="atx-panel.js"></script>
 </body>
 </html>

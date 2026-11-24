@@ -72,6 +72,7 @@
                 throw new Error(await response.text());
             }
             Profiles.save(storage, result.state);
+            window.dispatchEvent(new Event("kvm-config-changed"));
             setOpen(false);
             // 画面由服务端在配置变了之后自己重开，这边只需要把键鼠换到新串口
             const connected = window.KvmInput ? await KvmInput.reconnect() : false;

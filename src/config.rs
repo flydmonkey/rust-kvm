@@ -21,6 +21,8 @@ pub struct Config {
     pub video: VideoSettings,
     pub audio: AudioSettings,
     pub serial: SerialSettings,
+    /// ATX 电源继电器，`None`（JSON 里是 `null`）表示没接
+    pub atx: Option<AtxSettings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +98,27 @@ impl Default for SerialSettings {
             port: String::new(),
             baud_rate: 115200,
             mouse_mode: "absolute".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AtxSettings {
+    /// 继电器的串口。和 CH9329 多半都是 CH340，靠口名区分，不靠 VID/PID
+    pub port: String,
+    /// 接电源键的那一路，1–4
+    pub channel: u8,
+    /// 接复位键的那一路，没接是 `None`；不能和电源键同一路
+    pub reset_channel: Option<u8>,
+}
+
+impl Default for AtxSettings {
+    fn default() -> Self {
+        Self {
+            port: String::new(),
+            channel: 1,
+            reset_channel: None,
         }
     }
 }
