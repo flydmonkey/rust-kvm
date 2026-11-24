@@ -527,7 +527,7 @@
 </head>
 <body>
 <canvas id="screen"></canvas>
-<div id="stats" class="overlay">正在连接…</div>
+<div id="stats" class="overlay hidden">正在连接…</div>
 <!-- 图标用内联 SVG：emoji 在各系统上渲染差异太大，且语义常对不上。
      默认收起，只留右边那截把手——画面不该一上来就被挡住。
 
@@ -579,7 +579,7 @@
             <path d="M12 16.5v-5.5"/>
             <path d="M12 7.5h.01"/>
         </svg>
-        <span class="tooltip" id="stats-tip">隐藏连接信息</span>
+        <span class="tooltip" id="stats-tip">显示连接信息</span>
     </button>
     <button id="fullscreen" type="button" aria-label="全屏">
         <svg class="icon-enter-fullscreen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
