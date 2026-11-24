@@ -406,7 +406,7 @@ Windows 上 `serialport` 打开的是同步句柄，一个阻塞在 `ReadFile` �
 
 ### 浅色主题
 
-照搬 chrome-kvm 的 `theme.js` / `theme.css`：设置页最下面「外观」选跟随系统、浅色或深色，
+照搬 chrome-kvm 的 `theme.js` / `theme.css`：设置页最上面「外观」选跟随系统、浅色或深色，
 立即生效，存在本机浏览器（`rust-kvm-theme`），多标签页同步。两个页面的颜色全部走
 `theme.css` 里的变量，深色下的半透明白叠加在浅色下换成同等分量的半透明黑，层次不变。
 `theme.js` 在 `<head>` 里同步执行，赶在绘制前定下主题，不会先闪一下深色。画面四周的

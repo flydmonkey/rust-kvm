@@ -196,6 +196,19 @@
         <a href="/">返回控制页</a></p>
 
     <section>
+        <h2>外观</h2>
+        <div class="field">
+            <label for="theme-select">主题</label>
+            <select id="theme-select">
+                <option value="auto">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+            </select>
+        </div>
+        <p class="hint">立即生效，不用点「保存」；只存在这台电脑的浏览器里。</p>
+    </section>
+
+    <section>
         <h2>被控机配置</h2>
         <div class="field">
             <label for="profile-select">当前配置</label>
@@ -322,19 +335,6 @@
         <button id="reload" type="button">重新枚举设备</button>
         <span id="save-status"></span>
     </div>
-
-    <section>
-        <h2>外观</h2>
-        <div class="field">
-            <label for="theme-select">主题</label>
-            <select id="theme-select">
-                <option value="auto">跟随系统</option>
-                <option value="light">浅色</option>
-                <option value="dark">深色</option>
-            </select>
-        </div>
-        <p class="hint">立即生效，不用点「保存」；只存在这台电脑的浏览器里。</p>
-    </section>
 </main>
 <script src="serial-ws.js"></script>
 <script src="ch9329.js"></script>
