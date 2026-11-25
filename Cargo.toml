@@ -46,3 +46,13 @@ windows = { version = "0.62.2", features = [
 # 注册成服务跑在 session 0。除了开机自启，这也是唯一能看到物理音频端点的办法：
 # 远程桌面会话里那些端点会被换成「远程音频」。详见 service.rs。
 windows-service = "0.8.0"
+
+[target.'cfg(not(windows))'.dependencies]
+# 没有 Media Foundation 的平台上 H.264 走软件编码。用自带源码编译的版本，不依赖
+# 系统里装没装 libopenh264，x86 和 ARM 都一样能编。
+openh264 = "0.9.10"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# 只为了 sched_setscheduler：cpal 的 realtime 在 Linux 上只会走 rtkit 的 D-Bus，
+# 无头机器上多半没有 rtkit，等于没开。详见 audio.rs 里的 promote_audio_thread。
+libc = "0.2"
