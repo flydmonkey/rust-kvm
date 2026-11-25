@@ -7,12 +7,14 @@
 //! 编码那部分**直接用服务端那份 `h264::Encoder`**，不另写一份——探针的价值就在于
 //! 验的是真代码。
 //!
-//! 三个模式：
+//! 四个模式：
 //!
 //! - `cargo run --bin probe-h264` —— 编码器探针
 //! - `cargo run --bin probe-h264 -- --grab` —— 从采集卡抓一帧存成 `frame.jpg`
 //! - `cargo run --bin probe-h264 -- --jpeg frame.jpg` —— 解成 NV12，把 Y 平面存成
 //!   `frame-y.pgm` 肉眼看几何对不对，并横向采样报 Y/U/V
+//! - `cargo run --release --bin probe-h264 -- --bench frame.jpg 60` —— 分段量解码和
+//!   编码的单帧耗时，看这台机器 60fps（或别的帧率）够不够
 //!
 //! **采集卡被服务占着时抓不到帧**，先 `rust-kvm stop`。
 
@@ -43,7 +45,12 @@ fn main() -> Result<()> {
             let path = args.get(1).map(String::as_str).unwrap_or("frame.jpg");
             jpeg_probe::to_pgm(path, "frame-y.pgm")
         }
-        Some(other) => anyhow::bail!("不认识的参数 {other}（只有 --grab 和 --jpeg）"),
+        Some("--bench") => {
+            let path = args.get(1).map(String::as_str).unwrap_or("frame.jpg");
+            let fps = args.get(2).and_then(|fps| fps.parse().ok()).unwrap_or(60);
+            bench(path, fps)
+        }
+        Some(other) => anyhow::bail!("不认识的参数 {other}（只有 --grab、--jpeg 和 --bench）"),
         None => encoder_probe(),
     }
 }
@@ -193,6 +200,65 @@ fn encoder_probe() -> Result<()> {
 
     println!();
     println!("含 SPS，codec 字符串 {codec} —— 前提成立，可以往下走");
+    Ok(())
+}
+
+/// 管线两段各自的单帧耗时：JPEG→NV12 和 H.264 编码。帧率能上多少看的是这两个数——
+/// 串在一个线程里时是它们的和，拆成流水线后是较大的那个。
+///
+/// 编码分「画面在动」和「静止」两种量：openh264 对没变的宏块直接 skip，静止时便宜得多，
+/// 而 KVM 的画面大部分时间不动，只看动态的数会把开销高估。
+fn bench(path: &str, fps: u32) -> Result<()> {
+    const ROUNDS: usize = 120;
+
+    prepare_encoder()?;
+    let jpeg = std::fs::read(path)?;
+    let mut frame = nv12::Nv12Frame::new(0, 0);
+    nv12::decode_jpeg_to_nv12(&jpeg, &mut frame)?;
+    println!("{path}：{} 字节，{}x{}", jpeg.len(), frame.width, frame.height);
+
+    let started = Instant::now();
+    for _ in 0..ROUNDS {
+        nv12::decode_jpeg_to_nv12(&jpeg, &mut frame)?;
+    }
+    let decode = started.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64;
+
+    let mut encoder = h264::Encoder::new(h264::EncoderConfig {
+        width: frame.width,
+        height: frame.height,
+        fps,
+        bitrate_kbps: 4000,
+    })?;
+    let mut time_encode = |frame: &mut nv12::Nv12Frame, moving: bool| -> Result<f64> {
+        let started = Instant::now();
+        for i in 0..ROUNDS {
+            if moving {
+                // 只挪 Y 平面的前几行就够让每帧都有变化，又不至于整屏变成噪声
+                let w = frame.width as usize;
+                frame.data[..w * 64].rotate_left(i % 7 + 1);
+            }
+            encoder.encode(frame)?;
+        }
+        Ok(started.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64)
+    };
+    let moving = time_encode(&mut frame, true)?;
+    let still = time_encode(&mut frame, false)?;
+
+    let budget = 1000.0 / fps as f64;
+    println!("JPEG→NV12  {decode:6.2} ms");
+    println!("编码（动） {moving:6.2} ms");
+    println!("编码（静） {still:6.2} ms");
+    println!("{fps}fps 每帧预算 {budget:.2} ms");
+    println!(
+        "  串行（动）{:.2} ms，{}",
+        decode + moving,
+        if decode + moving <= budget { "够" } else { "不够" }
+    );
+    println!(
+        "  流水线（动）{:.2} ms，{}",
+        decode.max(moving),
+        if decode.max(moving) <= budget { "够" } else { "不够" }
+    );
     Ok(())
 }
 

@@ -5,7 +5,7 @@
 //! 好让别的程序（或者本地的 chrome-kvm）能用这张卡。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -41,6 +41,8 @@ const IDLE_GRACE: Duration = Duration::from_secs(3);
 /// 编码线程连续这么多帧解不开 JPEG 才算真坏、回落 MJPEG。偶发一帧坏的（MS2109
 /// 刚开流时就会吐几帧）跳过就行，不值得把整条 H.264 路掐掉。约一秒的量。
 const MAX_BAD_JPEGS: u32 = 30;
+
+const EMPTY_JPEG: [u8; 4] = [0xFF, 0xD8, 0xFF, 0xD9];
 
 /// 采集循环为什么停下来。两者的善后完全不同：没人看就安静退出，
 /// 换了配置得立刻按新设备重开，不能走「出错后等一秒」那条退避路径。
@@ -405,25 +407,138 @@ async fn supervise_encoder(hub: Arc<VideoHub>) {
 ///
 /// 这个循环是 JPEG 广播的一个**普通订阅者**，并排挂在现有管线旁边——所以原来那条
 /// MJPEG 路径一行都不用改，风险严格为零。
+///
+/// 解码和编码拆在两个线程上流水线跑。1080p 一帧解 JPEG 七到十毫秒、编码八到十毫秒，
+/// 串着做是 18ms，而 60fps 的预算只有 16.7ms；拆开后吞吐只看慢的那一段。两段之间
+/// 只有两块 NV12 缓冲来回倒手，交接是 rendezvous（容量 0），最多压一帧，不会攒出延迟。
+///
+/// 编码留在本线程（spawn_blocking 那个），不跨线程：Windows 的编码器是 COM 对象，
+/// 挪不得。解码线程只碰 JPEG 和 NV12。
 fn encode_loop(hub: &VideoHub) -> Result<()> {
     let config = hub.config.lock().expect("config 锁").clone();
-    let mut encoder = Encoder::new(EncoderConfig {
-        width: config.width,
-        height: config.height,
-        fps: config.fps,
-        bitrate_kbps: config.bitrate_kbps,
-    })?;
 
     // 先订阅再唤醒采集，顺序和 `subscribe` 里一样的理由
-    let mut frames = hub.subscribe();
-    let mut nv12 = Nv12Frame::new(config.width, config.height);
-    let mut bad_jpegs = 0;
-    let mut pacer = Pacer::new(config.fps);
-    info!(
-        "编码已启动 {}x{} H.264 @{} kbps",
-        config.width, config.height, config.bitrate_kbps
-    );
+    let frames = hub.subscribe();
+    let (free_tx, free_rx) = mpsc::sync_channel(PIPELINE_BUFFERS);
+    for _ in 0..PIPELINE_BUFFERS {
+        free_tx
+            .send(Nv12Frame::new(config.width, config.height))
+            .expect("通道刚建好，容量够放");
+    }
+    let (full_tx, full_rx) = mpsc::sync_channel(0);
+    let stopped = AtomicBool::new(false);
+    let stopped = &stopped;
 
+    std::thread::scope(|scope| {
+        let decoder = std::thread::Builder::new()
+            .name("jpeg-decode".into())
+            .spawn_scoped(scope, move || {
+                decode_frames(frames, config.fps, free_rx, full_tx, stopped)
+            })
+            .context("起解码线程失败")?;
+        // 两条通道的这一头随 `encode_frames` 返回一起丢掉，解码线程下一次交接就会
+        // 发现、自己退出
+        let encoded = encode_frames(hub, &config, full_rx, free_tx);
+        stopped.store(true, Ordering::SeqCst);
+        let decoded = decoder
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("解码线程 panic 了")));
+        encoded.and(decoded)
+    })
+}
+
+/// 两块就够流水线：解码线程填一块的时候，编码线程在编另一块。
+const PIPELINE_BUFFERS: usize = 2;
+
+/// 流水线的前半段：从 JPEG 广播收帧、按帧率节流、解成 NV12 交给编码线程。
+fn decode_frames(
+    mut frames: broadcast::Receiver<Bytes>,
+    fps: u32,
+    free: mpsc::Receiver<Nv12Frame>,
+    full: mpsc::SyncSender<Nv12Frame>,
+    stopped: &AtomicBool,
+) -> Result<()> {
+    let mut pacer = Pacer::new(fps);
+    let mut bad_jpegs = 0;
+    // 解坏了的那块缓冲留着下次用，不必还回去再取
+    let mut spare: Option<Nv12Frame> = None;
+    loop {
+        let Some(jpeg) = newest_jpeg(&mut frames) else {
+            return Ok(());
+        };
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if !pacer.admit(Instant::now()) {
+            continue;
+        }
+        let mut frame = match spare.take() {
+            Some(frame) => frame,
+            None => match free.recv() {
+                Ok(frame) => frame,
+                Err(_) => return Ok(()),
+            },
+        };
+        if let Err(e) = decode_jpeg_to_nv12(&jpeg, &mut frame) {
+            bad_jpegs += 1;
+            if bad_jpegs >= MAX_BAD_JPEGS {
+                return Err(e.context(format!("连续 {bad_jpegs} 帧 JPEG 解不开")));
+            }
+            debug!("跳过一帧解不开的 JPEG: {e:#}");
+            spare = Some(frame);
+            continue;
+        }
+        bad_jpegs = 0;
+        if full.send(frame).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// 等一帧，再把已经排着的都跳过，只要最新那帧。
+///
+/// 编码偶尔慢一下时广播里会积几帧，按顺序一帧帧去追的话，画面就一直落后那么几帧
+/// ——KVM 要的是现在的画面，不是把错过的补齐。
+///
+/// `Lagged` 是同一件事更严重的版本：积满了，最老的被挤掉。**这里不能补 IDR。** 丢的
+/// 是*输入*，不是输出——编码器对拿到的帧依次编码，P 帧参照的是它上一次编过的那帧，
+/// 和跳过多少采集帧无关，码流始终是完整的，下游照样解得出来，只是帧率低一些。曾经在
+/// 这儿补 IDR，结果是个正反馈：IDR 大 → 编得更慢 → 落后更多 → 补更多 IDR。实测把
+/// 30fps 压成了 2fps 的全 IDR 流。客户端丢包才需要 IDR，那是 `pump_h264` 的事。
+fn newest_jpeg(frames: &mut broadcast::Receiver<Bytes>) -> Option<Bytes> {
+    let mut jpeg = loop {
+        match frames.blocking_recv() {
+            Ok(jpeg) => break jpeg,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                debug!("编码落后 {skipped} 帧（编码比采集慢）");
+            }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    };
+    loop {
+        match frames.try_recv() {
+            Ok(newer) => jpeg = newer,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return Some(jpeg),
+        }
+    }
+}
+
+/// 流水线的后半段：编码、发包、报 codec 字符串。退出条件都在这边查，解码线程跟着
+/// 通道断开退出。
+///
+/// 编码器按**第一帧的实际尺寸**建，不按配置。两个原因：采集卡协商到的分辨率可以和
+/// 请求的不一样（`Closest`）；而且改分辨率时 `reconfigured` 会被重开的采集循环清掉，
+/// 这边要是正卡在等帧，就看不见那个标志，下一帧直接是新尺寸。所以中途尺寸变了不当
+/// 错误，正常退出，由 `supervise_encoder` 按新尺寸重建——走这条路它会把 codec 字符串
+/// 清掉，客户端跟着重配解码器。
+fn encode_frames(
+    hub: &VideoHub,
+    config: &VideoSettings,
+    full: mpsc::Receiver<Nv12Frame>,
+    free: mpsc::SyncSender<Nv12Frame>,
+) -> Result<()> {
+    let mut encoder: Option<(Encoder, (u32, u32))> = None;
     loop {
         if hub.encoded.receiver_count() == 0 {
             return Ok(());
@@ -432,41 +547,44 @@ fn encode_loop(hub: &VideoHub) -> Result<()> {
             // 采集要按新配置重开，编码器的尺寸/码率也可能跟着变，一起重建
             return Ok(());
         }
-        if hub.keyframe_wanted.swap(false, Ordering::SeqCst) {
+        // 编码器还没建的话第一帧本来就是 IDR，这个请求清掉也无妨
+        if hub.keyframe_wanted.swap(false, Ordering::SeqCst)
+            && let Some((encoder, _)) = encoder.as_mut()
+        {
             encoder.request_keyframe();
         }
 
-        let jpeg = match frames.blocking_recv() {
-            Ok(jpeg) => jpeg,
-            // 编码器喂不饱：采集比我们快，中间几帧没拿到。
-            //
-            // **这里不能补 IDR。** 丢的是*输入*，不是输出——编码器对拿到的帧依次
-            // 编码，P 帧参照的是它上一次编过的那帧，和跳过多少采集帧无关，码流
-            // 始终是完整的，下游照样解得出来，只是帧率低一些。
-            //
-            // 曾经在这儿补 IDR，结果是个正反馈：IDR 大 → 编得更慢 → 落后更多 →
-            // 补更多 IDR。实测把 30fps 压成了 2fps 的全 IDR 流。客户端丢包才需要
-            // IDR，那是 `pump_h264` 的事。
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                debug!("编码落后 {skipped} 帧（编码比采集慢）");
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        let Ok(frame) = full.recv() else {
+            // 解码线程退出了（出错的话它的结果由 `encode_loop` 汇报）
+            return Ok(());
         };
-
-        if !pacer.admit(Instant::now()) {
-            continue;
-        }
-        if let Err(e) = decode_jpeg_to_nv12(&jpeg, &mut nv12) {
-            bad_jpegs += 1;
-            if bad_jpegs >= MAX_BAD_JPEGS {
-                return Err(e.context(format!("连续 {bad_jpegs} 帧 JPEG 解不开")));
+        let size = (frame.width, frame.height);
+        let encoder = match &mut encoder {
+            Some((_, built)) if *built != size => {
+                info!(
+                    "采集分辨率从 {}x{} 变成 {}x{}，重建编码器",
+                    built.0, built.1, size.0, size.1
+                );
+                return Ok(());
             }
-            debug!("跳过一帧解不开的 JPEG: {e:#}");
-            continue;
-        }
-        bad_jpegs = 0;
-        for packet in encoder.encode(&nv12)? {
+            Some((encoder, _)) => encoder,
+            None => {
+                let built = Encoder::new(EncoderConfig {
+                    width: size.0,
+                    height: size.1,
+                    fps: config.fps,
+                    bitrate_kbps: config.bitrate_kbps,
+                })?;
+                info!(
+                    "编码已启动 {}x{} H.264 @{} kbps，{} fps",
+                    size.0, size.1, config.bitrate_kbps, config.fps
+                );
+                &mut encoder.insert((built, size)).0
+            }
+        };
+        let packets = encoder.encode(&frame);
+        let _ = free.send(frame);
+        for packet in packets? {
             let _ = hub.encoded.send(packet);
         }
         // codec 字符串要等第一个 SPS 才知道，所以每轮都问一下，直到问出来。
@@ -581,12 +699,20 @@ fn capture_loop(hub: &VideoHub) -> Result<StopReason> {
         // 连 SOI 都没有的直接丢：MS2109 刚开流那几帧就是这样的垃圾，整块 4 MB
         // 缓冲区发出去浏览器也解不了。有 SOI 但结构走不通的照原样发，那种由
         // 浏览器去判断，不在这里替它丢。
+        //
+        // 只有 SOI+EOI 的空帧也丢。MS2109 的 1080p60 是假的：真画面只有 30 帧，每隔
+        // 一帧插一个 `FFD8 FFD9` 凑数。这种帧发给浏览器白解一次，进了编码线程就是一次
+        // 解码失败——还会跟流水线的节奏锁在一起，次次挑中空帧，连错 30 帧整路回落。
         if !frame.starts_with(&[0xFF, 0xD8]) {
             debug!("丢掉一帧不是 JPEG 的缓冲区（{} B）", frame.len());
         } else {
             let jpeg = &frame[..jpeg_len(&frame).unwrap_or(frame.len())];
-            let _ = hub.frames.send(Bytes::copy_from_slice(jpeg));
-            hub.record_frame(jpeg.len());
+            if jpeg == EMPTY_JPEG {
+                debug!("丢掉一帧空 JPEG（只有 SOI+EOI）");
+            } else {
+                let _ = hub.frames.send(Bytes::copy_from_slice(jpeg));
+                hub.record_frame(jpeg.len());
+            }
         }
 
         if hub.reconfigured.load(Ordering::SeqCst) {
@@ -681,7 +807,28 @@ fn pick_device(hint: &str) -> Result<CameraIndex> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Pacer, jpeg_len};
+    use bytes::Bytes;
+    use tokio::sync::broadcast;
+
+    use super::{Pacer, jpeg_len, newest_jpeg};
+
+    #[test]
+    fn newest_jpeg_skips_queued_frames() {
+        let (tx, mut rx) = broadcast::channel(4);
+        for i in 0..3u8 {
+            tx.send(Bytes::from(vec![i])).unwrap();
+        }
+        assert_eq!(newest_jpeg(&mut rx).as_deref(), Some(&[2u8][..]));
+
+        // 积满被挤掉（Lagged）也照样拿到最新的，不报错
+        for i in 10..20u8 {
+            tx.send(Bytes::from(vec![i])).unwrap();
+        }
+        assert_eq!(newest_jpeg(&mut rx).as_deref(), Some(&[19u8][..]));
+
+        drop(tx);
+        assert_eq!(newest_jpeg(&mut rx), None);
+    }
 
     /// 按 `source_fps` 喂 `seconds` 秒、到达时刻带 ±`jitter_ms` 的交替抖动，数放行了几帧
     fn admitted(target_fps: u32, source_fps: u32, jitter_ms: u64, seconds: u32) -> usize {

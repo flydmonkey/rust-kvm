@@ -12,7 +12,7 @@
         [960, 540],
         [640, 360]
     ];
-    const FPS = [30, 25, 20, 15, 10];
+    const FPS = [60, 30, 25, 20, 15, 10];
     const CODECS = [
         {value: "mjpeg", label: "MJPEG（延迟最低）"},
         {value: "h264", label: "H.264（省带宽）"}
