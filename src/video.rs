@@ -11,11 +11,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use nokhwa::pixel_format::RgbFormat;
+use nokhwa::Camera;
 use nokhwa::utils::{
-    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-    Resolution,
+    CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
 };
-use nokhwa::{Camera, query};
 use tokio::sync::{Notify, broadcast, watch};
 use tracing::{debug, info, warn};
 
@@ -38,6 +37,10 @@ pub const CODEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// 最后一个观看者离开后再多采这么久。刷新页面时连接会断开重连，留个缓冲
 /// 就不会把设备反复开关（MS2109 重新打开要一秒左右）。
 const IDLE_GRACE: Duration = Duration::from_secs(3);
+
+/// 编码线程连续这么多帧解不开 JPEG 才算真坏、回落 MJPEG。偶发一帧坏的（MS2109
+/// 刚开流时就会吐几帧）跳过就行，不值得把整条 H.264 路掐掉。约一秒的量。
+const MAX_BAD_JPEGS: u32 = 30;
 
 /// 采集循环为什么停下来。两者的善后完全不同：没人看就安静退出，
 /// 换了配置得立刻按新设备重开，不能走「出错后等一秒」那条退避路径。
@@ -414,6 +417,8 @@ fn encode_loop(hub: &VideoHub) -> Result<()> {
     // 先订阅再唤醒采集，顺序和 `subscribe` 里一样的理由
     let mut frames = hub.subscribe();
     let mut nv12 = Nv12Frame::new(config.width, config.height);
+    let mut bad_jpegs = 0;
+    let mut pacer = Pacer::new(config.fps);
     info!(
         "编码已启动 {}x{} H.264 @{} kbps",
         config.width, config.height, config.bitrate_kbps
@@ -449,7 +454,18 @@ fn encode_loop(hub: &VideoHub) -> Result<()> {
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
         };
 
-        decode_jpeg_to_nv12(&jpeg, &mut nv12)?;
+        if !pacer.admit(Instant::now()) {
+            continue;
+        }
+        if let Err(e) = decode_jpeg_to_nv12(&jpeg, &mut nv12) {
+            bad_jpegs += 1;
+            if bad_jpegs >= MAX_BAD_JPEGS {
+                return Err(e.context(format!("连续 {bad_jpegs} 帧 JPEG 解不开")));
+            }
+            debug!("跳过一帧解不开的 JPEG: {e:#}");
+            continue;
+        }
+        bad_jpegs = 0;
         for packet in encoder.encode(&nv12)? {
             let _ = hub.encoded.send(packet);
         }
@@ -476,6 +492,47 @@ fn encode_loop(hub: &VideoHub) -> Result<()> {
                 state.fallback_reason = None;
             });
         }
+    }
+}
+
+/// 按配置的帧率给编码线程放行帧，多出来的在解码之前就丢掉。
+///
+/// 采集卡不一定理会请求的帧率：MS2109 接 60Hz 的源就照样吐 60fps。1080p 解 JPEG
+/// 加编码单核只够 30 帧上下，不节流的话编码线程整核跑满，多的帧最后也是被
+/// `Lagged` 丢掉——白算了一遍。
+///
+/// 放行窗口提前 0.4 个间隔：帧到达有抖动，掐着整点放行的话，源和目标同为 30fps
+/// 时早到一毫秒的帧会被丢，帧率掉成 15。也不能到 0.5——源恰好是目标两倍时，中间
+/// 那帧正落在半个间隔上，就一帧都丢不掉了。
+struct Pacer {
+    interval: Duration,
+    slack: Duration,
+    next: Option<Instant>,
+}
+
+impl Pacer {
+    fn new(fps: u32) -> Self {
+        let interval = Duration::from_secs(1) / fps.max(1);
+        Self {
+            interval,
+            slack: interval * 2 / 5,
+            next: None,
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> bool {
+        if let Some(next) = self.next {
+            if now + self.slack < next {
+                return false;
+            }
+            // 按节拍往后排而不是从 now 起算，长期平均才准；落后超过一拍（卡顿、
+            // 编码慢）就从现在重新起拍，不去补那些已经错过的帧。
+            let after = next + self.interval;
+            self.next = Some(if after < now { now + self.interval } else { after });
+        } else {
+            self.next = Some(now + self.interval);
+        }
+        true
     }
 }
 
@@ -518,10 +575,19 @@ fn capture_loop(hub: &VideoHub) -> Result<StopReason> {
             Err(e) => break Err(anyhow::anyhow!(e).context("取帧失败")),
         };
 
-        // 采集卡直出 JPEG，原样广播。send 在没有订阅者时会返回 Err，
-        // 那不是错误，下面的 receiver_count 会处理退出。
-        let _ = hub.frames.send(Bytes::copy_from_slice(&frame));
-        hub.record_frame(frame.len());
+        // 采集卡直出 JPEG，裁掉缓冲区的填充后原样广播（见 `jpeg_len`）。send 在没有
+        // 订阅者时会返回 Err，那不是错误，下面的 receiver_count 会处理退出。
+        //
+        // 连 SOI 都没有的直接丢：MS2109 刚开流那几帧就是这样的垃圾，整块 4 MB
+        // 缓冲区发出去浏览器也解不了。有 SOI 但结构走不通的照原样发，那种由
+        // 浏览器去判断，不在这里替它丢。
+        if !frame.starts_with(&[0xFF, 0xD8]) {
+            debug!("丢掉一帧不是 JPEG 的缓冲区（{} B）", frame.len());
+        } else {
+            let jpeg = &frame[..jpeg_len(&frame).unwrap_or(frame.len())];
+            let _ = hub.frames.send(Bytes::copy_from_slice(jpeg));
+            hub.record_frame(jpeg.len());
+        }
 
         if hub.reconfigured.load(Ordering::SeqCst) {
             break Ok(StopReason::Reconfigured);
@@ -542,8 +608,64 @@ fn capture_loop(hub: &VideoHub) -> Result<StopReason> {
     result
 }
 
+/// 一帧 JPEG 的真实长度：从 SOI 按段走到 EOI。
+///
+/// Linux 上非裁不可：nokhwa 的 V4L2 后端把整块 mmap 缓冲区原样交出来，丢掉了内核
+/// 报的 `bytesused`。缓冲区按 YUYV 最坏情况分配（1080p 是 4 MB），而 JPEG 只有
+/// 八十来 KB——不裁的话每帧发 4 MB，30fps 就是 800 多 Mbps。
+///
+/// 不能从尾部往前找最后一个 `FFD9`：缓冲区是循环复用的，上一帧比这帧长时，它的
+/// 结尾（连同那个旧 EOI）还留在后面。头部也不能直接搜，APPn 段里可以是任意字节。
+/// 所以老老实实按结构走：段按长度跳过，扫描数据里 `FF` 后面跟 `00` 是转义、跟
+/// `D0`–`D7` 是重启标记，其余就是下一个段。
+///
+/// 结构不对就返回 `None`，调用方照原样发——那是坏帧，不该由这里决定丢不丢。
+fn jpeg_len(buf: &[u8]) -> Option<usize> {
+    if !buf.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        if *buf.get(i)? != 0xFF {
+            return None;
+        }
+        // 段前可以垫任意个 FF
+        while *buf.get(i)? == 0xFF {
+            i += 1;
+        }
+        let marker = buf[i];
+        i += 1;
+        match marker {
+            0xD9 => return Some(i),
+            // 没有长度字段的独立标记
+            0x01 | 0xD0..=0xD7 => continue,
+            _ => {}
+        }
+        let len = u16::from_be_bytes([*buf.get(i)?, *buf.get(i + 1)?]) as usize;
+        // 长度把自己那两个字节算在内，小于 2 只能是坏数据，不拦会原地打转
+        if len < 2 {
+            return None;
+        }
+        i += len;
+        if marker != 0xDA {
+            continue;
+        }
+        // SOS 之后是熵编码数据，一直到下一个真正的标记为止
+        loop {
+            let at = i + buf.get(i..)?.iter().position(|&b| b == 0xFF)?;
+            match *buf.get(at + 1)? {
+                0x00 | 0xD0..=0xD7 => i = at + 2,
+                _ => {
+                    i = at;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn pick_device(hint: &str) -> Result<CameraIndex> {
-    let devices = query(ApiBackend::Auto).context("枚举采集设备失败")?;
+    let devices = crate::camera::capture_devices()?;
     if devices.is_empty() {
         bail!("没有找到任何视频采集设备");
     }
@@ -553,4 +675,94 @@ fn pick_device(hint: &str) -> Result<CameraIndex> {
         .find(|info| !hint.is_empty() && info.human_name().contains(hint))
         .unwrap_or(&devices[0]);
     Ok(picked.index().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{Pacer, jpeg_len};
+
+    /// 按 `source_fps` 喂 `seconds` 秒、到达时刻带 ±`jitter_ms` 的交替抖动，数放行了几帧
+    fn admitted(target_fps: u32, source_fps: u32, jitter_ms: u64, seconds: u32) -> usize {
+        let mut pacer = Pacer::new(target_fps);
+        let start = Instant::now() + Duration::from_millis(jitter_ms);
+        let period = Duration::from_secs(1) / source_fps;
+        (0..source_fps * seconds)
+            .filter(|&i| {
+                let jitter = Duration::from_millis(jitter_ms);
+                let t = start + period * i;
+                pacer.admit(if i % 2 == 0 { t + jitter } else { t - jitter })
+            })
+            .count()
+    }
+
+    #[test]
+    fn pacer_halves_a_60fps_source() {
+        assert_eq!(admitted(30, 60, 0, 10), 300);
+        assert_eq!(admitted(30, 60, 3, 10), 300);
+    }
+
+    #[test]
+    fn pacer_keeps_every_frame_when_source_matches() {
+        assert_eq!(admitted(30, 30, 0, 10), 300);
+        assert_eq!(admitted(30, 30, 5, 10), 300);
+    }
+
+    #[test]
+    fn pacer_passes_a_slower_source_untouched() {
+        assert_eq!(admitted(30, 25, 2, 10), 250);
+    }
+
+    #[test]
+    fn pacer_restarts_after_a_stall_instead_of_bursting() {
+        let mut pacer = Pacer::new(30);
+        let t0 = Instant::now();
+        assert!(pacer.admit(t0));
+        // 卡了一秒，之后 60fps 来帧：不该把错过的 30 拍一口气补放
+        let resume = t0 + Duration::from_secs(1);
+        let period = Duration::from_secs(1) / 60;
+        let burst = (0..6).filter(|&i| pacer.admit(resume + period * i)).count();
+        assert_eq!(burst, 3);
+    }
+
+    /// 拼一个结构完整的假 JPEG：APP0 段里故意放一个 FFD9，扫描数据里放转义的
+    /// FF00 和一个重启标记，都不能被当成结尾。
+    fn fake_jpeg() -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend([0xFF, 0xE0, 0x00, 0x04, 0xFF, 0xD9]);
+        jpeg.extend([0xFF, 0xDA, 0x00, 0x03, 0x01]);
+        jpeg.extend([0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56]);
+        jpeg.extend([0xFF, 0xD9]);
+        jpeg
+    }
+
+    #[test]
+    fn 走到真正的_eoi_为止() {
+        let jpeg = fake_jpeg();
+        assert_eq!(jpeg_len(&jpeg), Some(jpeg.len()));
+    }
+
+    /// 这就是 V4L2 那个缓冲区的样子：真 JPEG 后面跟着上一帧残留的尾巴，
+    /// 里面还有一个旧的 EOI。从后往前找的话会把那段残留一起发出去。
+    #[test]
+    fn 不被缓冲区里上一帧的残留骗到() {
+        let jpeg = fake_jpeg();
+        let mut buffer = jpeg.clone();
+        buffer.extend([0x77, 0x88, 0xFF, 0xD9, 0x00, 0x00, 0x00]);
+        assert_eq!(jpeg_len(&buffer), Some(jpeg.len()));
+    }
+
+    #[test]
+    fn 不是_jpeg_或者截断了就说不知道() {
+        assert_eq!(jpeg_len(&[0x00, 0x01, 0x02]), None);
+        let jpeg = fake_jpeg();
+        assert_eq!(jpeg_len(&jpeg[..jpeg.len() - 2]), None);
+    }
+
+    /// 长度字段是 0 或 1 的坏段，不拦的话会在同一个位置无限循环。
+    #[test]
+    fn 坏的段长度不会卡死() {
+        assert_eq!(jpeg_len(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x00, 0xFF, 0xD9]), None);
+    }
 }

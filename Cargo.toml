@@ -53,6 +53,10 @@ windows-service = "0.8.0"
 openh264 = "0.9.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# 只为了 sched_setscheduler：cpal 的 realtime 在 Linux 上只会走 rtkit 的 D-Bus，
-# 无头机器上多半没有 rtkit，等于没开。详见 audio.rs 里的 promote_audio_thread。
+# 只为了 pthread_setschedparam：cpal 的 realtime 在 Linux 上要另开 realtime-dbus 才
+# 会去找 rtkit，不开就是个静默的空操作；开了也得机器上真有 rtkit，无头机器上多半
+# 没有。所以自己提。详见 audio.rs 里的 promote_audio_thread。
 libc = "0.2"
+# nokhwa 底层就是它，版本跟着 nokhwa 走，不多编译东西。只用来问 VIDIOC_QUERYCAP：
+# UVC 设备会多出一个只能采元数据的 /dev/videoN，nokhwa 照样把它列成摄像头。
+v4l = "0.14"

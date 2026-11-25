@@ -1946,6 +1946,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "v4l",
  "windows",
  "windows-service",
  "windows-sys 0.61.2",

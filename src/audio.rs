@@ -9,6 +9,9 @@
 //! 远程桌面会话里 Windows 会把物理音频端点换成「远程音频」，物理设备在那个会话
 //! 里根本不被枚举——cpal 会报「一个输入设备都没有」，而设备管理器里明明是好的。
 //! 视频没这个问题（摄像头不按会话隔离），所以这个坑只在音频这条路上等着。
+//!
+//! Linux 上没有会话隔离，对应的坑是权限：跑服务的用户不在 `audio` 组里时，
+//! ALSA 同样一个设备都列不出来。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,6 +49,17 @@ const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 设了这个环境变量就用测试音源代替真设备。见 `tone_loop`。
 const TONE_ENV: &str = "RUST_KVM_AUDIO_TEST";
+
+/// 一个输入设备都列不出来时给人看的话。空列表在每个平台上几乎都只有一个原因，
+/// 直说比让人去猜好。设置页的设备列表也用这一句。
+#[cfg(windows)]
+pub const NO_INPUT_DEVICES: &str = "没有找到任何音频输入设备。如果服务是在远程桌面会话里启动的，\
+     物理音频端点在那个会话里不可见，需要改到控制台会话或 Windows 服务里跑";
+#[cfg(target_os = "linux")]
+pub const NO_INPUT_DEVICES: &str = "没有找到任何音频输入设备。先看 arecord -l 里有没有采集卡；\
+     有的话多半是跑服务的用户不在 audio 组里";
+#[cfg(not(any(windows, target_os = "linux")))]
+pub const NO_INPUT_DEVICES: &str = "没有找到任何音频输入设备";
 
 /// 采音循环为什么停下来。和 `video` 里同名的东西一个意思：没人听就安静退出，
 /// 换了配置得立刻按新设备重开，不走出错退避。
@@ -460,16 +474,23 @@ struct Pipeline {
     narrowband: Option<Narrowband>,
     /// 进入窄带那一步时的声道数，也就是设备**实际**的声道数（quirk 之后的）
     channels: usize,
+    /// 第一次回调时把所在线程提到实时优先级，见 `promote_audio_thread`。放在这儿
+    /// 是因为回调线程是 cpal 自己建的，只有回调里才摸得到它。
+    promote: bool,
 }
 
 impl Pipeline {
     fn publish(&mut self, hub: &AudioHub, samples: impl Iterator<Item = i16>, count: usize) {
+        if std::mem::take(&mut self.promote) {
+            promote_audio_thread();
+        }
         // 分别借用两个字段：`align` 的返回值借着它的缓冲，此时还要 `narrowband`
         // 的可变借用，整体借 `self` 会过不了
         let Self {
             align,
             narrowband,
             channels,
+            ..
         } = self;
 
         match (align, narrowband) {
@@ -533,17 +554,22 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
         align,
         narrowband,
         channels: actual.channels as usize,
+        promote: wants_realtime(&device),
     };
 
     let error_hub = hub.clone();
     let on_error = move |e: cpal::Error| {
         error_hub.record_stream_error(format!("音频流错误: {e}"));
-        // 瞬时的只有这两种：Xrun 是欠载/溢出，流还在跑；DeviceChanged 是音频
-        // 路由变了、cpal 已经自己重定向好了，文档明说不用重建。**其余一律当致命**
+        // 不致命的只有这三种：Xrun 是欠载/溢出，流还在跑；DeviceChanged 是音频
+        // 路由变了、cpal 已经自己重定向好了，文档明说不用重建；RealtimeDenied 是
+        // cpal 自己提优先级没提上，流照常在跑。**其余一律当致命**
         // ——未知错误按致命处理最坏是白重建一次流（声音断一下就回来），按瞬时
         // 处理则会永久假活：页面显示在采音、字节数不动、没有任何错误，而且永远
         // 不会自己恢复。两种猜错的代价差得太远。
-        if matches!(e.kind(), ErrorKind::Xrun | ErrorKind::DeviceChanged) {
+        if matches!(
+            e.kind(),
+            ErrorKind::Xrun | ErrorKind::DeviceChanged | ErrorKind::RealtimeDenied
+        ) {
             warn!("音频流错误（瞬时）: {e}");
             return;
         }
@@ -637,6 +663,63 @@ fn capture_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
     outcome
 }
 
+/// 和 audio_thread_priority 给 cpal 用的默认值一样。systemd 单元里的 `LimitRTPRIO`
+/// 也照这个数给，所以是 `pub`。
+#[cfg(target_os = "linux")]
+pub const REALTIME_PRIORITY: i32 = 10;
+
+/// 只给直通硬件的 PCM 提优先级。
+///
+/// 走 PipeWire / PulseAudio 的那些，真正的实时活儿在音频服务器里，客户端线程提上去
+/// 只会和它抢；`null` 设备的 poll 永远立刻返回，提成实时就是一个核被吃满。cpal 自己
+/// 的 `is_rt_eligible` 也是按这个思路挑的，只是那个判断它不对外开放。
+#[cfg(target_os = "linux")]
+fn wants_realtime(device: &Device) -> bool {
+    let Ok(id) = device.id() else {
+        return false;
+    };
+    let id = id.to_string();
+    let pcm = id.strip_prefix("alsa:").unwrap_or(&id);
+    ["hw:", "plughw:", "sysdefault:", "front:", "dsnoop:"]
+        .iter()
+        .any(|prefix| pcm.starts_with(prefix))
+}
+
+/// Windows 上 cpal 的 `realtime` 自己会走 MMCSS，不用我们管。
+#[cfg(not(target_os = "linux"))]
+fn wants_realtime(_device: &Device) -> bool {
+    false
+}
+
+/// 把当前线程（cpal 的采音线程）提到 `SCHED_FIFO`。
+///
+/// 要治的病和 Windows 上那次爆音是同一个：采音线程跟 30 Mbps 的视频推流抢 CPU，
+/// 错过截止时间 ALSA 就 overrun 丢样本。cpal 的 `realtime` 在 Linux 上指望不上
+/// （见 Cargo.toml 里 libc 那条），只能自己来。
+///
+/// 要权限：root，或者 `RLIMIT_RTPRIO` 不低于 `REALTIME_PRIORITY`（`rust-kvm install`
+/// 装的 systemd 单元里给了）。提不上只是少一层保险，采音照常，所以只记警告。
+#[cfg(target_os = "linux")]
+fn promote_audio_thread() {
+    let param = libc::sched_param {
+        sched_priority: REALTIME_PRIORITY,
+    };
+    // 返回值就是错误码本身，不走 errno
+    let code =
+        unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
+    if code == 0 {
+        info!("采音线程已提到实时优先级（SCHED_FIFO {REALTIME_PRIORITY}）");
+    } else {
+        warn!(
+            "采音线程提实时优先级失败：{}。负载高时可能爆音；用 rust-kvm install 装成服务就有权限",
+            std::io::Error::from_raw_os_error(code)
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn promote_audio_thread() {}
+
 fn f32_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
@@ -677,6 +760,7 @@ fn tone_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
         align: None,
         narrowband,
         channels: CHANNELS as usize,
+        promote: false,
     };
     hub.mark_capturing(true, Some(format));
     info!("采音用的是测试音源（{TONE_ENV} 已设），{TONE_HZ} Hz 正弦");
@@ -729,20 +813,20 @@ fn pick_device(hint: &str) -> Result<Device> {
         .collect();
 
     if devices.is_empty() {
-        // 这个提示是有来历的：远程桌面会话里物理音频端点会被换成「远程音频」，
-        // 设备管理器里一切正常，但进程一个输入设备都枚举不到。
-        bail!(
-            "没有找到任何音频输入设备。\
-             如果服务是在远程桌面会话里启动的，物理音频端点在那个会话里不可见，\
-             需要改到控制台会话或 Windows 服务里跑"
-        );
+        bail!("{NO_INPUT_DEVICES}");
     }
 
-    // 0.18 起 cpal 没有 name()，设备名走 Display
-    if !hint.is_empty()
-        && let Some(device) = devices.iter().find(|d| d.to_string().contains(hint))
-    {
-        return Ok(device.clone());
+    if !hint.is_empty() {
+        // 先认 ID。ALSA 下同一张卡会以 hw:、plughw:、dsnoop: 等好几个 PCM 出现，名字
+        // 一字不差，设置页遇到这种情况存的就是 ID，只按名字找会落到第一个同名的上
+        let by_id = devices
+            .iter()
+            .find(|d| d.id().is_ok_and(|id| id.to_string() == hint));
+        // 0.18 起 cpal 没有 name()，设备名走 Display
+        let by_name = || devices.iter().find(|d| d.to_string().contains(hint));
+        if let Some(device) = by_id.or_else(by_name) {
+            return Ok(device.clone());
+        }
     }
 
     if let Some(device) = host.default_input_device() {

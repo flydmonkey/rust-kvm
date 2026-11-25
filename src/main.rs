@@ -5,6 +5,7 @@
 
 mod atx;
 mod audio;
+mod camera;
 mod certs;
 mod config;
 mod devices;
@@ -13,6 +14,8 @@ mod nv12;
 mod serial_bridge;
 #[cfg(windows)]
 mod service;
+#[cfg(target_os = "linux")]
+mod systemd;
 mod video;
 
 use std::net::SocketAddr;
@@ -66,6 +69,7 @@ struct AppState {
     cert_pem: Arc<Vec<u8>>,
 }
 
+#[cfg(windows)]
 const USAGE: &str = "\
 用法：
   rust-kvm              直接在当前窗口跑（Ctrl+C 停）
@@ -77,6 +81,25 @@ const USAGE: &str = "\
 
 装成服务不只是为了开机自启：服务跑在 session 0，那是唯一能枚举到物理音频设备
 的地方——远程桌面会话里采集卡的音频口根本不可见。";
+
+#[cfg(target_os = "linux")]
+const USAGE: &str = "\
+用法：
+  rust-kvm                  直接在当前终端跑（Ctrl+C 停）
+  sudo rust-kvm install     拷到 /usr/local/bin 并注册成开机自启的 systemd 服务
+                            （在项目目录里跑，资源和配置留在这里）
+  sudo rust-kvm uninstall   卸载服务，连同 /usr/local/bin 里那份
+  sudo rust-kvm start       启动服务
+  sudo rust-kvm stop        停止服务
+  rust-kvm status           看服务状态和日志位置
+
+服务以执行 install 的那个用户身份跑，附加 video / audio / dialout 组并允许实时
+优先级——前台跑时设备权限来自登录会话，服务里没有那一层。";
+
+#[cfg(not(any(windows, target_os = "linux")))]
+const USAGE: &str = "\
+用法：
+  rust-kvm              直接在当前终端跑（Ctrl+C 停）";
 
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -108,9 +131,24 @@ fn run_command(command: &str) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn run_command(command: &str) -> Result<()> {
-    anyhow::bail!("服务管理只在 Windows 上可用，收到命令：{command}")
+    match command {
+        "install" => systemd::install(),
+        "uninstall" => systemd::uninstall(),
+        "start" => systemd::start(),
+        "stop" => systemd::stop(),
+        "status" => systemd::status(),
+        other => {
+            eprintln!("未知命令：{other}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn run_command(command: &str) -> Result<()> {
+    anyhow::bail!("服务管理只在 Windows 和 Linux 上可用，收到命令：{command}")
 }
 
 /// 日志去处：控制台模式进 stdout，服务模式进文件（服务没有 stdout）。
@@ -133,7 +171,12 @@ pub(crate) fn init_logging(file: Option<&std::path::Path>) -> Result<()> {
                 .init();
         }
         None => {
-            tracing_subscriber::fmt().with_max_level(level).init();
+            // systemd 把 stdout 接进 journal，那里的颜色转义会原样变成 `[2m` 之类的乱码
+            use std::io::IsTerminal;
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(std::io::stdout().is_terminal())
+                .init();
         }
     }
     info!("日志级别 {level}（改 RUST_KVM_LOG 可调）");
@@ -204,11 +247,11 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         .serve(app.into_make_service());
 
     // 控制台模式下 Ctrl+C 也走优雅关闭，主要是为了让串口线程把「全释放」包发出去：
-    // 直接杀进程的话，被控机上按下的键会一直卡着。服务模式下这个 task 收不到信号，
-    // 停止请求由 SCM 通过同一个 handle 送进来。
+    // 直接杀进程的话，被控机上按下的键会一直卡着。Windows 服务模式下这个 task 收不到
+    // 信号，停止请求由 SCM 通过同一个 handle 送进来；systemd 则是发 SIGTERM。
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("收到 Ctrl+C，开始收尾");
+        if let Some(signal) = shutdown_signal().await {
+            info!("收到 {signal}，开始收尾");
             handle.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
         }
     });
@@ -216,6 +259,22 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
     tokio::try_join!(https, http).context("HTTP 服务退出")?;
     info!("已停止");
     Ok(())
+}
+
+/// 等到该停的信号，返回它的名字；等不了（注册失败）就是 `None`，那就只能被硬杀。
+async fn shutdown_signal() -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // systemctl stop 和 kill 默认发的都是它，不接的话就是直接死，键会卡着
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            return tokio::select! {
+                result = tokio::signal::ctrl_c() => result.ok().map(|()| "Ctrl+C"),
+                _ = terminate.recv() => Some("SIGTERM"),
+            };
+        }
+    }
+    tokio::signal::ctrl_c().await.ok().map(|()| "Ctrl+C")
 }
 
 async fn ws_video(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -727,6 +786,7 @@ async fn download_cert(State(state): State<AppState>) -> Response {
 ///
 /// **不能依赖当前工作目录**：服务是被 SCM 拉起来的，工作目录是
 /// `C:\Windows\System32`，那里既没有 `web/` 也不该往里写证书和日志。
+/// systemd 默认的工作目录是 `/`，同理。
 /// 只有实在找不到时才退回 `.`，那种情况下多半是 exe 被单独拷走了。
 pub(crate) fn asset_root() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {

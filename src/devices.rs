@@ -4,12 +4,10 @@
 //! chrome-kvm 那套「浏览器弹窗授权选设备」。列表只能由服务端给。
 //!
 //! 每一类都带自己的 `error`，而不是整体失败或者返回空列表了事。空列表的原因
-//! 往往才是用户真正需要知道的——尤其音频：远程桌面会话里物理端点根本不被枚举，
-//! 光看到一个空下拉框没人猜得出来是为什么。
+//! 往往才是用户真正需要知道的——尤其音频：远程桌面会话里物理端点根本不被枚举
+//! （Linux 上则是用户不在 `audio` 组），光看到一个空下拉框没人猜得出来是为什么。
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use nokhwa::utils::ApiBackend;
-use nokhwa::query;
 use serde::Serialize;
 
 use crate::serial_bridge::{self, PortInfo};
@@ -54,6 +52,9 @@ pub struct VideoDevice {
 #[serde(rename_all = "camelCase")]
 pub struct AudioDevice {
     pub name: String,
+    /// cpal 的设备 ID（如 `alsa:hw:CARD=MS2109,DEV=0`）。名字不唯一时设置页靠它区分：
+    /// ALSA 下同一张卡会以好几个 PCM 出现，名字一字不差。
+    pub id: Option<String>,
     /// 设备自报的默认配置。这两个值值得显示出来：这张采集卡报的是 96000 Hz
     /// 单声道，光看名字看不出它和普通麦克风的区别。
     pub sample_rate: Option<u32>,
@@ -71,7 +72,7 @@ pub fn enumerate() -> Devices {
 /// 只列名字，不去问每个设备支持哪些分辨率——那需要真的打开设备，而采集卡是
 /// 独占的，枚举时打开会跟正在推流的采集撞车。要看格式清单用 `cargo run --bin probe`。
 fn video_devices() -> DeviceList<VideoDevice> {
-    match query(ApiBackend::Auto) {
+    match crate::camera::capture_devices() {
         Ok(devices) => DeviceList::ok(
             devices
                 .iter()
@@ -81,7 +82,7 @@ fn video_devices() -> DeviceList<VideoDevice> {
                 })
                 .collect(),
         ),
-        Err(e) => DeviceList::failed(format!("枚举视频设备失败: {e}")),
+        Err(e) => DeviceList::failed(format!("{e:#}")),
     }
 }
 
@@ -98,6 +99,7 @@ fn audio_devices() -> DeviceList<AudioDevice> {
             AudioDevice {
                 // cpal 0.18 起没有 name()，设备名走 Display
                 name: device.to_string(),
+                id: device.id().ok().map(|id| id.to_string()),
                 sample_rate: config.as_ref().map(|c| c.sample_rate()),
                 channels: config.as_ref().map(|c| c.channels()),
             }
@@ -105,12 +107,7 @@ fn audio_devices() -> DeviceList<AudioDevice> {
         .collect();
 
     if items.is_empty() {
-        // 空列表在这里几乎总是同一个原因，直说比让人去猜好
-        return DeviceList::failed(
-            "没有找到任何音频输入设备。如果服务是在远程桌面会话里启动的，\
-             物理音频端点在那个会话里不可见，需要改到控制台会话或 Windows 服务里跑"
-                .to_string(),
-        );
+        return DeviceList::failed(crate::audio::NO_INPUT_DEVICES.to_string());
     }
     DeviceList::ok(items)
 }

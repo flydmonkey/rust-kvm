@@ -1,16 +1,13 @@
-//! H.264 编码器。全部 unsafe COM 代码关在这一个文件里，对外只有一个同步接口。
+//! H.264 编码器。对外只有一个同步接口：喂 NV12，拿 Annex-B 包。
+//!
+//! 按平台二选一：
+//!
+//! - Windows：Media Foundation 的编码 MFT，多半落到显卡的硬件编码器上。
+//! - 其余平台：openh264 软件编码，源码随 crate 编进来，不依赖系统里装没装库。
 //!
 //! 为什么单独成文件：这里的性质和项目其余部分完全不同——别处是普通 Rust，这里
-//! 每一行都要盯着 COM 的生命周期和 HRESULT。混在 `video.rs` 里的话，读那个文件的
-//! 人得同时装着两套心智模型。
-//!
-//! 硬件 MFT 是**异步**的：不能像同步 MFT 那样「推一帧、拉一次」，必须等
-//! `METransformNeedInput` 才推、等 `METransformHaveOutput` 才拉，否则 `ProcessOutput`
-//! 直接报 `E_UNEXPECTED`（0x8000FFFF「灾难性故障」，一个毫无指向性的错误码）。
-//! 但调用方没必要知道这些：采集循环本来就是一帧一帧同步走的，所以 `encode()` 内部
-//! 把事件循环跑完再返回这一帧产生的包。
-//!
-//! 非 Windows 目标上 `Encoder::new` 直接返回 `Err`，调用方回落 MJPEG。
+//! 每一行都要盯着 COM 的生命周期和 HRESULT（或者 openh264 的 C 接口）。混在
+//! `video.rs` 里的话，读那个文件的人得同时装着两套心智模型。
 
 use bytes::Bytes;
 
@@ -31,28 +28,55 @@ pub struct EncodedFrame {
     pub keyframe: bool,
 }
 
-#[cfg(not(windows))]
-pub struct Encoder;
-
-#[cfg(not(windows))]
-impl Encoder {
-    pub fn new(_config: EncoderConfig) -> anyhow::Result<Self> {
-        anyhow::bail!("H.264 编码目前只实现了 Windows（Media Foundation）这一条路")
-    }
-
-    pub fn encode(
-        &mut self,
-        _frame: &crate::nv12::Nv12Frame,
-    ) -> anyhow::Result<Vec<EncodedFrame>> {
-        unreachable!("拿不到 Encoder 实例")
-    }
-
-    pub fn request_keyframe(&mut self) {}
-
-    pub fn codec_string(&self) -> Option<String> {
-        None
+/// 扫 Annex-B 起始码，回调每个 NAL 的类型和它在包里的位置。
+///
+/// 三字节（00 00 01）和四字节（00 00 00 01）两种起始码都要认：编码器两种都
+/// 可能吐，实测 AMD 的首包是四字节。
+fn for_each_nal(packet: &[u8], mut f: impl FnMut(u8, usize) -> bool) {
+    let mut i = 0;
+    while i + 3 < packet.len() {
+        let header = if packet[i..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if packet[i..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let at = i + header;
+        if at >= packet.len() {
+            return;
+        }
+        if f(packet[at] & 0x1f, at) {
+            return;
+        }
+        i = at;
     }
 }
+
+/// 从 Annex-B 码流里找 SPS，拼出 WebCodecs 要的 `avc1.PPCCLL`。
+///
+/// 不写死：编码器实际协商出的 profile 可能和我们请求的不同，而写死会让浏览器
+/// 静默解码失败——既没有错误也没有画面，极难查。三个字节就在 SPS 最前面。
+pub(crate) fn codec_string_from_annexb(packet: &[u8]) -> Option<String> {
+    let mut found = None;
+    for_each_nal(packet, |kind, at| {
+        if kind == 7 && at + 3 < packet.len() {
+            found = Some(format!(
+                "avc1.{:02X}{:02X}{:02X}",
+                packet[at + 1],
+                packet[at + 2],
+                packet[at + 3]
+            ));
+            return true;
+        }
+        false
+    });
+    found
+}
+
+#[cfg(not(windows))]
+pub use openh264_encoder::Encoder;
 
 #[cfg(windows)]
 pub use windows_encoder::Encoder;
@@ -61,6 +85,209 @@ pub use windows_encoder::Encoder;
 #[allow(unused_imports)]
 pub use windows_encoder::list_encoders;
 
+/// openh264 软件编码。
+///
+/// 码率控制和 Windows 那边取同一个意图——**静止趋近于零、动起来有天花板**——但手段
+/// 不同：openh264 没有「恒定质量 + 上限」这种组合，所以用码率模式加跳帧。码率模式
+/// 不会像 MF 的 CBR 那样填充码流：画面不动时宏块全是 skip，一帧只剩几十字节。
+/// 动得太猛时它宁可丢帧也不超预算，对 WAN 来说这正是想要的取舍。
+#[cfg(not(windows))]
+mod openh264_encoder {
+    use anyhow::{Context, Result, bail};
+    use bytes::Bytes;
+    use openh264::encoder::{
+        BitRate, Complexity, EncoderConfig as Settings, FrameRate, FrameType, IntraFramePeriod,
+        RateControlMode, UsageType, VuiConfig,
+    };
+    use openh264::formats::YUVSlices;
+    use openh264::{OpenH264API, Timestamp};
+
+    use super::{EncodedFrame, EncoderConfig, codec_string_from_annexb};
+    use crate::nv12::Nv12Frame;
+
+    /// 和 Windows 那边一样开到 10 秒，新人进场靠强制 IDR。
+    const GOP_SECONDS: u32 = 10;
+
+    pub struct Encoder {
+        inner: openh264::encoder::Encoder,
+        config: EncoderConfig,
+        /// openh264 只吃三平面的 I420，而 NV12 的 U、V 是交织的，每帧拆一次。
+        /// 缓冲留着复用，理由同 `Nv12Frame`。
+        u: Vec<u8>,
+        v: Vec<u8>,
+        frames: u64,
+        /// 要到真的编出一个 IDR 才清：跳帧模式下被请求的那一帧可能正好被跳掉，
+        /// 只请求一次的话，新观看者就要等十秒后的下一个自然关键帧。
+        keyframe_wanted: bool,
+        codec_string: Option<String>,
+    }
+
+    impl Encoder {
+        pub fn new(config: EncoderConfig) -> Result<Self> {
+            if config.width == 0 || config.height == 0 || config.fps == 0 {
+                bail!("编码参数不合法：{}x{} @{}fps", config.width, config.height, config.fps);
+            }
+            // I420 的色度平面是 w/2 × h/2，奇数尺寸在 openh264 的绑定里是断言失败（panic），
+            // 不是错误返回，所以得在这儿先拦住
+            if config.width % 2 == 1 || config.height % 2 == 1 {
+                bail!("openh264 只收偶数尺寸，{}x{} 不行", config.width, config.height);
+            }
+
+            let settings = Settings::new()
+                // 屏幕内容模式对文字和大片纯色更友好，KVM 的画面基本就是这些
+                .usage_type(UsageType::ScreenContentRealTime)
+                // 屏幕内容模式不支持这两项，留着默认的「开」它会自己关掉，但每次建编码器
+                // 都往 stderr 打一行警告
+                .adaptive_quantization(false)
+                .background_detection(false)
+                .rate_control_mode(RateControlMode::Bitrate)
+                .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000))
+                .skip_frames(true)
+                .max_frame_rate(FrameRate::from_hz(config.fps as f32))
+                .intra_frame_period(IntraFramePeriod::from_num_frames(config.fps * GOP_SECONDS))
+                // 软件编码，1080p30 要一帧 33ms 内做完，复杂度只能给最低档
+                .complexity(Complexity::Low)
+                // 采集卡的 JPEG 是 BT.601 满幅（JFIF 就是这么定义的），要在 SPS 里写明。
+                // 不写的话解码端按 studio swing 解释，黑的更黑白的更白，颜色发飘
+                .vui(VuiConfig::bt601().full_range(true));
+            let inner =
+                openh264::encoder::Encoder::with_api_config(OpenH264API::from_source(), settings)
+                    .context("建 openh264 编码器失败")?;
+
+            let chroma = (config.width / 2 * config.height / 2) as usize;
+            Ok(Self {
+                inner,
+                config,
+                u: vec![0; chroma],
+                v: vec![0; chroma],
+                frames: 0,
+                keyframe_wanted: false,
+                codec_string: None,
+            })
+        }
+
+        pub fn request_keyframe(&mut self) {
+            self.keyframe_wanted = true;
+        }
+
+        pub fn codec_string(&self) -> Option<String> {
+            self.codec_string.clone()
+        }
+
+        pub fn encode(&mut self, frame: &Nv12Frame) -> Result<Vec<EncodedFrame>> {
+            if frame.width != self.config.width || frame.height != self.config.height {
+                bail!(
+                    "帧尺寸 {}x{} 和编码器的 {}x{} 不符（采集分辨率变了，要重建编码器）",
+                    frame.width,
+                    frame.height,
+                    self.config.width,
+                    self.config.height
+                );
+            }
+            // 第一帧本来就是 IDR。而且 openh264 要到第一次 encode 才真正初始化，
+            // 之前调 force_intra_frame 是在对一个还没建好的编码器下指令
+            if self.keyframe_wanted && self.frames > 0 {
+                self.inner.force_intra_frame();
+            }
+
+            let (w, h) = (frame.width as usize, frame.height as usize);
+            let (y, uv) = frame.data.split_at(w * h);
+            deinterleave(uv, &mut self.u, &mut self.v);
+            let source = YUVSlices::new((y, &self.u, &self.v), (w, h), (w, w / 2, w / 2));
+            // 码率控制按时间戳算每帧的预算，乱给（比如全是 0）会让它算不出码率
+            let timestamp = Timestamp::from_millis(self.frames * 1000 / self.config.fps as u64);
+            self.frames += 1;
+
+            let stream = self
+                .inner
+                .encode_at(&source, timestamp)
+                .context("openh264 编码失败")?;
+            let kind = stream.frame_type();
+            // 被码率控制跳掉的帧没有输出。不是错误，下一帧照常
+            if matches!(kind, FrameType::Skip | FrameType::Invalid) {
+                return Ok(Vec::new());
+            }
+            let data = stream.to_vec();
+            if data.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let keyframe = kind == FrameType::IDR;
+            if keyframe {
+                self.keyframe_wanted = false;
+            }
+            if self.codec_string.is_none() {
+                self.codec_string = codec_string_from_annexb(&data);
+            }
+            Ok(vec![EncodedFrame {
+                data: Bytes::from(data),
+                keyframe,
+            }])
+        }
+    }
+
+    /// NV12 的 UV 平面（U 在前）拆成 I420 的两个平面。
+    fn deinterleave(uv: &[u8], u: &mut [u8], v: &mut [u8]) {
+        let pairs = uv.as_chunks::<2>().0;
+        for ((pair, u), v) in pairs.iter().zip(u.iter_mut()).zip(v.iter_mut()) {
+            *u = pair[0];
+            *v = pair[1];
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// U、V 拆反了画面照样出得来，只是颜色整体偏掉（蓝的变红），编码器和解码器
+        /// 都不会报错——这种错只有测试拦得住。
+        #[test]
+        fn 交织的_uv_拆成两个平面且_u_在前() {
+            let uv = [10, 20, 11, 21, 12, 22];
+            let (mut u, mut v) = ([0; 3], [0; 3]);
+            deinterleave(&uv, &mut u, &mut v);
+            assert_eq!(u, [10, 11, 12]);
+            assert_eq!(v, [20, 21, 22]);
+        }
+
+        /// 编码器本身也过一遍：第一帧必须是带 SPS 的关键帧，codec 字符串得拼得出来。
+        /// 这两样缺一个，浏览器那头就配不出解码器。
+        #[test]
+        fn 第一帧是带_sps_的关键帧() {
+            let config = EncoderConfig {
+                width: 64,
+                height: 48,
+                fps: 30,
+                bitrate_kbps: 500,
+            };
+            let mut encoder = Encoder::new(config).unwrap();
+            let mut frame = Nv12Frame::new(64, 48);
+            frame.data.fill(128);
+            let packets = encoder.encode(&frame).unwrap();
+            assert!(packets.first().is_some_and(|p| p.keyframe));
+            assert!(encoder.codec_string().is_some_and(|c| c.starts_with("avc1.")));
+        }
+
+        #[test]
+        fn 奇数尺寸直接拒绝而不是_panic() {
+            let config = EncoderConfig {
+                width: 63,
+                height: 48,
+                fps: 30,
+                bitrate_kbps: 500,
+            };
+            assert!(Encoder::new(config).is_err());
+        }
+    }
+}
+
+/// Media Foundation 编码。全部 unsafe COM 代码关在这里。
+///
+/// 硬件 MFT 是**异步**的：不能像同步 MFT 那样「推一帧、拉一次」，必须等
+/// `METransformNeedInput` 才推、等 `METransformHaveOutput` 才拉，否则 `ProcessOutput`
+/// 直接报 `E_UNEXPECTED`（0x8000FFFF「灾难性故障」，一个毫无指向性的错误码）。
+/// 但调用方没必要知道这些：采集循环本来就是一帧一帧同步走的，所以 `encode()` 内部
+/// 把事件循环跑完再返回这一帧产生的包。
 #[cfg(windows)]
 mod windows_encoder {
     use std::sync::Once;
@@ -74,7 +301,7 @@ mod windows_encoder {
     use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
     use windows::core::{GUID, Interface};
 
-    use super::{EncodedFrame, EncoderConfig};
+    use super::{EncodedFrame, EncoderConfig, codec_string_from_annexb, for_each_nal};
     use crate::nv12::Nv12Frame;
 
     /// 等编码器要下一帧最多等这么久。给得比一帧（33ms）宽是为了容忍偶尔的抖动，
@@ -573,32 +800,6 @@ mod windows_encoder {
         }))
     }
 
-    /// 扫 Annex-B 起始码，回调每个 NAL 的类型和它在包里的位置。
-    ///
-    /// 三字节（00 00 01）和四字节（00 00 00 01）两种起始码都要认：编码器两种都
-    /// 可能吐，实测 AMD 的首包是四字节。
-    fn for_each_nal(packet: &[u8], mut f: impl FnMut(u8, usize) -> bool) {
-        let mut i = 0;
-        while i + 3 < packet.len() {
-            let header = if packet[i..].starts_with(&[0, 0, 0, 1]) {
-                4
-            } else if packet[i..].starts_with(&[0, 0, 1]) {
-                3
-            } else {
-                i += 1;
-                continue;
-            };
-            let at = i + header;
-            if at >= packet.len() {
-                return;
-            }
-            if f(packet[at] & 0x1f, at) {
-                return;
-            }
-            i = at;
-        }
-    }
-
     /// 5 = IDR 片，7 = SPS（编码器在每个 IDR 前重复 SPS/PPS）。
     fn has_keyframe_nal(packet: &[u8]) -> bool {
         let mut found = false;
@@ -611,68 +812,52 @@ mod windows_encoder {
         found
     }
 
-    /// 从 Annex-B 码流里找 SPS，拼出 WebCodecs 要的 `avc1.PPCCLL`。
-    ///
-    /// 不写死：编码器实际协商出的 profile 可能和我们请求的不同，而写死会让浏览器
-    /// 静默解码失败——既没有错误也没有画面，极难查。三个字节就在 SPS 最前面。
-    pub(super) fn codec_string_from_annexb(packet: &[u8]) -> Option<String> {
-        let mut found = None;
-        for_each_nal(packet, |kind, at| {
-            if kind == 7 && at + 3 < packet.len() {
-                found = Some(format!(
-                    "avc1.{:02X}{:02X}{:02X}",
-                    packet[at + 1],
-                    packet[at + 2],
-                    packet[at + 3]
-                ));
-                return true;
-            }
-            false
-        });
-        found
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        /// codec 字符串必须从 SPS 的三个字节拼出来，不能写死——编码器实际协商出别的
-        /// profile 时，写死的字符串会让浏览器静默解码失败，那种失败极难查。
-        #[test]
-        fn 从_sps_拼出_codec_字符串() {
-            // 起始码 + NAL 头(0x67 = SPS) + profile_idc, constraints, level_idc
-            let packet = [0u8, 0, 0, 1, 0x67, 0x4D, 0x40, 0x1E, 0xAB, 0xCD];
-            assert_eq!(codec_string_from_annexb(&packet).as_deref(), Some("avc1.4D401E"));
-        }
-
-        #[test]
-        fn 没有_sps_时给不出_codec_字符串() {
-            // 0x41 = 非 IDR 片，不是 SPS
-            let packet = [0u8, 0, 0, 1, 0x41, 0x9A, 0x00, 0x11];
-            assert_eq!(codec_string_from_annexb(&packet), None);
-        }
-
-        /// 三字节起始码也要认：编码器两种都可能吐。
-        #[test]
-        fn 认三字节起始码() {
-            let packet = [0u8, 0, 1, 0x67, 0x42, 0xE0, 0x1E, 0x00];
-            assert_eq!(codec_string_from_annexb(&packet).as_deref(), Some("avc1.42E01E"));
-        }
-
-        /// 实测 AMD 编码器的首包是「AUD 在前、SPS 在后」，所以不能只看第一个 NAL。
-        #[test]
-        fn 跳过前面的_aud_找到后面的_sps() {
-            let packet = [
-                0u8, 0, 0, 1, 0x09, 0x10, // AUD
-                0, 0, 0, 1, 0x67, 0x4D, 0x04, 0x28, 0xD9, 0x40, // SPS
-            ];
-            assert_eq!(codec_string_from_annexb(&packet).as_deref(), Some("avc1.4D0428"));
-        }
 
         #[test]
         fn idr_片算关键帧非_idr_不算() {
             assert!(has_keyframe_nal(&[0, 0, 0, 1, 0x65, 0x88, 0x00, 0x11]));
             assert!(!has_keyframe_nal(&[0, 0, 0, 1, 0x41, 0x9A, 0x00, 0x11]));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// codec 字符串必须从 SPS 的三个字节拼出来，不能写死——编码器实际协商出别的
+    /// profile 时，写死的字符串会让浏览器静默解码失败，那种失败极难查。
+    #[test]
+    fn 从_sps_拼出_codec_字符串() {
+        // 起始码 + NAL 头(0x67 = SPS) + profile_idc, constraints, level_idc
+        let packet = [0u8, 0, 0, 1, 0x67, 0x4D, 0x40, 0x1E, 0xAB, 0xCD];
+        assert_eq!(codec_string_from_annexb(&packet).as_deref(), Some("avc1.4D401E"));
+    }
+
+    #[test]
+    fn 没有_sps_时给不出_codec_字符串() {
+        // 0x41 = 非 IDR 片，不是 SPS
+        let packet = [0u8, 0, 0, 1, 0x41, 0x9A, 0x00, 0x11];
+        assert_eq!(codec_string_from_annexb(&packet), None);
+    }
+
+    /// 三字节起始码也要认：编码器两种都可能吐。
+    #[test]
+    fn 认三字节起始码() {
+        let packet = [0u8, 0, 1, 0x67, 0x42, 0xE0, 0x1E, 0x00];
+        assert_eq!(codec_string_from_annexb(&packet).as_deref(), Some("avc1.42E01E"));
+    }
+
+    /// 实测 AMD 编码器的首包是「AUD 在前、SPS 在后」，所以不能只看第一个 NAL。
+    #[test]
+    fn 跳过前面的_aud_找到后面的_sps() {
+        let packet = [
+            0u8, 0, 0, 1, 0x09, 0x10, // AUD
+            0, 0, 0, 1, 0x67, 0x4D, 0x04, 0x28, 0xD9, 0x40, // SPS
+        ];
+        assert_eq!(codec_string_from_annexb(&packet).as_deref(), Some("avc1.4D0428"));
     }
 }

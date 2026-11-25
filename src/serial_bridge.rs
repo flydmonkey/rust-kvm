@@ -97,6 +97,7 @@ pub fn list_ports() -> Vec<PortInfo> {
 
     ports
         .into_iter()
+        .filter(|port| has_hardware(&port.port_name))
         .map(|port| {
             // USB 转串口（CH340 之类）能报出产品名，认口比 COM 号直观得多
             let description = match port.port_type {
@@ -109,6 +110,26 @@ pub fn list_ports() -> Vec<PortInfo> {
             }
         })
         .collect()
+}
+
+/// Linux 上内核不管有没有硬件，都会预先建好 `ttyS0`–`ttyS31` 这一排传统 UART 节点，
+/// 不筛的话下拉框里三十多项，真正的 USB 串口被淹在中间。sysfs 的 `type` 是 0
+/// （`PORT_UNKNOWN`）就是没探到芯片，那种口打开了也收发不了任何东西。
+#[cfg(target_os = "linux")]
+fn has_hardware(port_name: &str) -> bool {
+    let Some(name) = port_name.strip_prefix("/dev/") else {
+        return true;
+    };
+    match std::fs::read_to_string(format!("/sys/class/tty/{name}/type")) {
+        Ok(kind) => kind.trim() != "0",
+        // 只有 8250 这类 UART 驱动才有这个属性，USB 串口没有，一律留着
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_hardware(_port_name: &str) -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------

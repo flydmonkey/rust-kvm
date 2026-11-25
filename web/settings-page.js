@@ -80,7 +80,12 @@
         if (!hint) {
             return;
         }
-        const matched = [...select.options].find((option) => option.value.includes(hint));
+        // 也比显示文字：同名的音频设备用 ID 当值（见 renderDevices），而老配置里
+        // 存的是名字
+        const options = [...select.options];
+        const matched = options.find((option) => option.value === hint)
+            || options.find((option) => option.value.includes(hint))
+            || options.find((option) => option.textContent.includes(hint));
         if (matched) {
             select.value = matched.value;
             return;
@@ -102,12 +107,20 @@
         );
         showProblem("video-problem", devices.video.error);
 
+        // Linux 的 ALSA 会把同一张卡列成 hw:、plughw:、dsnoop: 好几项，名字一字不差。
+        // 只有这种时候才拿 ID 当值并显示出来；名字唯一时照旧存名字，配置里好认
+        const nameCounts = new Map();
+        devices.audio.items.forEach((item) => {
+            nameCounts.set(item.name, (nameCounts.get(item.name) || 0) + 1);
+        });
         fill(
             audioDevice,
             devices.audio.items.map((item) => {
                 const rate = item.sampleRate ? `${item.sampleRate} Hz` : "采样率未知";
                 const channels = item.channels === 1 ? "单声道" : `${item.channels} 声道`;
-                return {value: item.name, label: `${item.name}（${rate}，${channels}）`};
+                const ambiguous = item.id && nameCounts.get(item.name) > 1;
+                const name = ambiguous ? `${item.name} [${item.id}]` : item.name;
+                return {value: ambiguous ? item.id : item.name, label: `${name}（${rate}，${channels}）`};
             })
         );
         showProblem("audio-problem", devices.audio.error);

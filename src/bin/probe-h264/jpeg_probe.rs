@@ -8,17 +8,15 @@
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
+use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{
-    ApiBackend, CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-};
-use nokhwa::{Camera, query};
+use nokhwa::utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
 
-use crate::nv12;
+use crate::{camera, nv12};
 
 /// 从采集卡抓一帧 MJPEG 原始字节存成文件。
 pub fn grab(path: &str) -> Result<()> {
-    let devices = query(ApiBackend::Auto).context("枚举采集设备失败")?;
+    let devices = camera::capture_devices()?;
     let device = devices
         .iter()
         .find(|d| d.human_name().contains("USB Video"))
@@ -29,7 +27,7 @@ pub fn grab(path: &str) -> Result<()> {
     let wanted = CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::MJPEG, 30);
     let request = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(wanted));
     let mut camera = Camera::new(device.index().clone(), request)
-        .context("打开采集卡失败（服务在跑的话先 rust-kvm.exe stop）")?;
+        .context("打开采集卡失败（服务在跑的话先 rust-kvm stop）")?;
     camera.open_stream().context("开流失败")?;
 
     // 头几帧常是黑的或者没曝光好，丢掉再取

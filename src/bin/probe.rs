@@ -8,12 +8,15 @@
 
 use std::time::{Duration, Instant};
 
+use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
-    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-    Resolution,
+    CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
 };
-use nokhwa::{Camera, query};
+
+// 和服务端用同一份枚举，否则 Linux 上探针会去开 UVC 的元数据节点
+#[path = "../camera.rs"]
+mod camera;
 
 const PROBE_SECONDS: u64 = 5;
 const TARGET: Resolution = Resolution {
@@ -23,10 +26,10 @@ const TARGET: Resolution = Resolution {
 const TARGET_FPS: u32 = 30;
 
 fn main() {
-    let devices = match query(ApiBackend::Auto) {
+    let devices = match camera::capture_devices() {
         Ok(devices) => devices,
         Err(e) => {
-            eprintln!("枚举设备失败: {e}");
+            eprintln!("{e:#}");
             return;
         }
     };

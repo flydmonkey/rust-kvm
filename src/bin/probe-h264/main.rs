@@ -1,4 +1,5 @@
-//! 探针：确认这台机器上的 H.264 编码 MFT 能不能用，以及 JPEG→NV12 那一步对不对。
+//! 探针：确认这台机器上的 H.264 编码器能不能用（Windows 是 MFT，别处是 openh264），
+//! 以及 JPEG→NV12 那一步对不对。
 //!
 //! 存在的理由：整个低带宽模式压在「编码器能开、能吃系统内存的 NV12、能吐 SPS」
 //! 这三件事上。先用一个小程序确认，而不是写完一整条管线之后才发现前提不成立。
@@ -13,9 +14,11 @@
 //! - `cargo run --bin probe-h264 -- --jpeg frame.jpg` —— 解成 NV12，把 Y 平面存成
 //!   `frame-y.pgm` 肉眼看几何对不对，并横向采样报 Y/U/V
 //!
-//! **采集卡被服务占着时抓不到帧**，先 `rust-kvm.exe stop`。
+//! **采集卡被服务占着时抓不到帧**，先 `rust-kvm stop`。
 
-use anyhow::Result;
+use std::time::Instant;
+
+use anyhow::{Result, bail};
 
 // 二进制之间不能互相 use，所以直接把模块源码包进来。项目里的探针本来就是这个
 // 路数（各自独立、不进服务端），比为此新开一个 lib target 轻。
@@ -27,6 +30,8 @@ use anyhow::Result;
 mod h264;
 #[path = "../../nv12.rs"]
 mod nv12;
+#[path = "../../camera.rs"]
+mod camera;
 
 mod jpeg_probe;
 
@@ -43,23 +48,10 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
-fn encoder_probe() -> Result<()> {
-    anyhow::bail!("编码器探针只在 Windows 上有意义");
-}
-
 #[cfg(windows)]
-fn encoder_probe() -> Result<()> {
-    use std::time::Instant;
-
-    use anyhow::{Context, bail};
+fn prepare_encoder() -> Result<()> {
+    use anyhow::Context;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-
-    const WIDTH: u32 = 1920;
-    const HEIGHT: u32 = 1080;
-    const FPS: u32 = 30;
-    const BITRATE_KBPS: u32 = 4000;
-    const FRAMES: usize = 60;
 
     // 服务端是在 spawn_blocking 的线程上跑编码的，那里 tokio 不会替我们初始化 COM
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
@@ -76,6 +68,28 @@ fn encoder_probe() -> Result<()> {
         bail!("一个都没有。低带宽模式在这台机器上没有出路。");
     }
     println!();
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn prepare_encoder() -> Result<()> {
+    // 软件编码最要紧的是快不快：debug 下慢好几倍，量出来的单帧耗时没有参考价值
+    if cfg!(debug_assertions) {
+        println!("注意：这是 debug 构建，单帧耗时要看 --release 的");
+    }
+    println!("编码器：openh264（软件，随 crate 编译）");
+    println!();
+    Ok(())
+}
+
+fn encoder_probe() -> Result<()> {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const FPS: u32 = 30;
+    const BITRATE_KBPS: u32 = 4000;
+    const FRAMES: usize = 60;
+
+    prepare_encoder()?;
 
     let mut encoder = h264::Encoder::new(h264::EncoderConfig {
         width: WIDTH,
@@ -92,6 +106,9 @@ fn encoder_probe() -> Result<()> {
     let mut bytes = 0usize;
     let mut packets = 0usize;
     let mut keyframes = 0usize;
+    // 关键帧里有几个带着 SPS。只有第一个带是不够的：新观看者是从强制的那个 IDR
+    // 开始解的，那里没有 SPS 的话浏览器的解码器起不来
+    let mut keyframes_with_sps = 0usize;
     let mut first: Option<bytes::Bytes> = None;
     let started = Instant::now();
 
@@ -110,6 +127,9 @@ fn encoder_probe() -> Result<()> {
             packets += 1;
             if packet.keyframe {
                 keyframes += 1;
+                if h264::codec_string_from_annexb(&packet.data).is_some() {
+                    keyframes_with_sps += 1;
+                }
             }
             if first.is_none() {
                 first = Some(packet.data);
@@ -148,6 +168,29 @@ fn encoder_probe() -> Result<()> {
     if keyframes < 2 {
         bail!("只有 {keyframes} 个关键帧，强制 IDR 没起作用。新观看者进场会一直黑屏。");
     }
+    if keyframes_with_sps < keyframes {
+        bail!(
+            "{keyframes} 个关键帧里只有 {keyframes_with_sps} 个带 SPS。中途进场的观看者配不出解码器。"
+        );
+    }
+
+    // 静止画面：这是低带宽模式最大的收益所在（KVM 的画面大部分时间不动），
+    // 码率控制要是把预算填满，整件事就白做了。前几帧还在收敛，只量后一半。
+    const STILL_FRAMES: usize = 60;
+    let mut still_bytes = 0usize;
+    for i in 0..STILL_FRAMES {
+        for packet in encoder.encode(&frame)? {
+            if i >= STILL_FRAMES / 2 {
+                still_bytes += packet.data.len();
+            }
+        }
+    }
+    let still_seconds = (STILL_FRAMES / 2) as f64 / FPS as f64;
+    println!(
+        "静止画面码率 {:.3} Mbps",
+        still_bytes as f64 * 8.0 / still_seconds / 1e6
+    );
+
     println!();
     println!("含 SPS，codec 字符串 {codec} —— 前提成立，可以往下走");
     Ok(())

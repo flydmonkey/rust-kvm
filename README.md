@@ -14,6 +14,7 @@
       —— 管线已验证，但**真实设备还没接通**，见「音频设备要看会话」
 - [x] 设置页：设备枚举、`config.json` 读写、保存后热切换
 - [x] 注册成 Windows 服务（开机自启，顺带解决音频设备看不见的问题）
+- [x] Linux 宿主机：V4L2 采集、ALSA 采音、openh264 软件编码、systemd 服务，见「Linux 宿主机」
 - [x] 控制页补齐：全屏 + Keyboard Lock、录制、粘贴、Ctrl+Alt+Del、松开所有键
 - [x] 热插拔恢复：采集卡、音频、串口三条路各自能自己接回来
 - [x] 低带宽模式：可切到 H.264（静止画面 0.02 Mbps）+ 窄带音频（384 kbps）
@@ -29,6 +30,12 @@
 
 ```bash
 cargo run
+```
+
+Linux 上先装两个开发包（cpal 要 ALSA 的头文件，serialport 靠 libudev 枚举 USB 串口）：
+
+```bash
+sudo apt install pkg-config libasound2-dev libudev-dev
 ```
 
 启动后日志里会列出所有可访问地址：
@@ -541,6 +548,68 @@ rust-kvm             不带参数就在当前窗口跑，Ctrl+C 停
 PowerShell 5.1 按 GBK 读，中文注释和字符串全是乱码；exe 往 stdout 写 UTF-8，要
 **临时**把 `[Console]::OutputEncoding` 切成 UTF-8 再切回来——全局改掉的话，脚本
 自己的输出被重定向时又全乱了。
+
+### Linux 宿主机
+
+```bash
+cargo build --release
+sudo target/release/rust-kvm install     # 拷到 /usr/local/bin，写 systemd 单元并 enable
+sudo rust-kvm start                      # 等到 8080 真能连上才返回
+journalctl -u rust-kvm -f                # 日志
+```
+
+`install` 要在项目目录里跑：资源目录（`web/`、`certs/`、`config.json`）就是这里，
+单元文件的 `WorkingDirectory` 指过来。程序本身拷到 `/usr/local/bin/rust-kvm`，服务
+跑的是那份拷贝——`target/` 会被 `cargo clean` 清掉，`CARGO_TARGET_DIR` 还可能在
+`/tmp` 下，直接指过去的话重启后服务就起不来。重新编译后再跑一次 `install` 换程序，
+服务在跑的话 `stop` 再 `start` 才生效。
+
+和 Windows 不同，装成服务**只是**为了开机自启——Linux 没有会话隔离，前台跑看到的
+设备和服务里一样。要操心的是权限：桌面登录时 logind 给当前用户挂了设备 ACL，所以
+前台跑一切正常；服务不在登录会话里，那条 ACL 不作数。单元文件因此以执行 `install`
+的那个用户（`SUDO_USER`）身份跑，附加 `video` / `audio` / `dialout` 组（不存在的组
+跳过，写进去服务会直接起不来），再给 `LimitRTPRIO`。不用 root 跑是因为 `certs/` 和
+`config.json` 归这个用户，root 写过之后再前台跑就改不动了。`systemctl stop` 发的
+SIGTERM 和 Ctrl+C 走同一条优雅关闭路径，「全释放」包照发。
+
+H.264 走 openh264 软件编码（源码随 crate 编进来，不依赖系统库）。实测 1080p 单帧
+11.5 ms，动态画面码率卡在设定的上限，静止画面 0.003 Mbps；JPEG 解码加编码大约吃
+一个核的八成（MS2109 1080p30 实测五成多）。编码线程按配置的帧率抽帧，多出来的帧
+连解码都不做：MS2109 接 60Hz 的源时会无视请求照吐 60fps，不抽的话编码线程整核跑满，
+多的帧最后也是被丢掉。openh264 没有 MF 那种「恒定质量 + 上限」，用的是码率模式加跳帧：
+画面不动时宏块全是 skip，动得太猛时宁可丢帧也不超预算。只出 Constrained Baseline
+（`avc1.42C028`），浏览器都认。
+
+移植时踩到的几个坑，都是 Windows 上不存在的：
+
+- **nokhwa 把整块 mmap 缓冲区当一帧交出来。** V4L2 的缓冲区按 YUYV 最坏情况分配
+  （1080p 是 4 MB），JPEG 只有八十来 KB，nokhwa 却丢掉了内核报的 `bytesused`。
+  不处理的话每帧发 4 MB，实测 816 Mbps。`video.rs` 的 `jpeg_len` 从 SOI 按段走到
+  EOI 再裁——不能从尾部往前找 `FFD9`，缓冲区是复用的，上一帧更长时它的旧 EOI
+  还留在后面。
+- **UVC 摄像头有两个 `/dev/video*`**，后一个只吐元数据，名字一模一样，nokhwa 还把
+  它排在前面。「没指定设备就用第一个」正好打开它，报一句毫无线索的
+  `Could not get device property CameraFormat`。`camera.rs` 按 `VIDIOC_QUERYCAP` 筛掉。
+- **ALSA 把同一张卡列成好几项**（`hw:`、`plughw:`、`dsnoop:`、`front:`…），名字
+  一字不差，采样率却不同（`hw:` 是设备原生格式，`plughw:` 会帮你转换）。
+  `/api/devices` 带上 cpal 的设备 ID，设置页只在同名时用 ID 当值。
+- **`/dev/ttyS0`–`ttyS31` 不管有没有硬件都在**，串口下拉框三十多项。sysfs 里
+  `type` 为 0 的筛掉。
+- **cpal 的 `realtime` 在 Linux 上是个静默的空操作**（要另开 `realtime-dbus` 才去找
+  rtkit，无头机器上多半也没有）。采音线程改由 `promote_audio_thread` 自己提到
+  `SCHED_FIFO`，只对直通硬件的 PCM 提——走 PipeWire 的那些实时活儿在音频服务器里，
+  `null` 设备的 poll 永远立刻返回，提上去会吃满一个核。前台跑没有权限，日志里会有
+  一条警告，不影响采音。
+
+MS2109 上实测：
+
+- **音频格式内核已经改正。** ALSA 报的就是 48000 Hz 双声道 S16_LE，
+  `hdmi_stereo_quirk` 只在设备自报 96k 单声道时才触发，所以不会修两遍。字节对齐
+  （Windows 上那个差一个采样的错位）还没测到：当时 HDMI 源没送声音，录到的全是 0。
+- **刚开流会吐几帧不是 JPEG 的缓冲区**（开头不是 `FFD8`），多见于关了马上重开。
+  以前 MJPEG 那路会把整块 4 MB 发出去，H.264 那路解码失败就整条回落到 MJPEG。现在
+  采集循环直接丢掉没有 SOI 的缓冲区，编码线程也只在连续 30 帧解不开时才回落。
+- 视频 1080p30 MJPEG，裁剪后约 38–64 Mbps（看画面），裁之前是 983 Mbps。
 
 ### 设置页：设备列表只能由服务端给
 
