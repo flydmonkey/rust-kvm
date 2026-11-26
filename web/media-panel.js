@@ -54,7 +54,7 @@
             const keep = slot.select.value;
             slot.select.replaceChildren(...UsbMedia.choices(overview.images, name)
                 .map((image) => new Option(image, image)));
-            if (keep) {
+            if (keep && [...slot.select.options].some((option) => option.value === keep)) {
                 slot.select.value = keep;
             }
             slot.state.textContent = UsbMedia.slotText(name, state);
@@ -148,13 +148,16 @@
             }
         };
         xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-                overview = JSON.parse(xhr.responseText);
-                toast(`已上传 ${file.name}`, "ok");
-            } else {
-                toast(`上传失败：${xhr.responseText || xhr.status}`, "error");
+            try {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    overview = JSON.parse(xhr.responseText);
+                    toast(`已上传 ${file.name}`, "ok");
+                } else {
+                    toast(`上传失败：${xhr.responseText || xhr.status}`, "error");
+                }
+            } finally {
+                finishUpload();
             }
-            finishUpload();
         };
         xhr.onerror = () => {
             toast("上传失败：连接中断", "error");

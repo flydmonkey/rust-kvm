@@ -53,7 +53,8 @@
         if (!target || !target.tagName) {
             return false;
         }
-        return target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+        return target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT"
+            || target.isContentEditable;
     }
 
     function inToolPanel(target) {
