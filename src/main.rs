@@ -17,6 +17,7 @@ mod serial_bridge;
 mod service;
 #[cfg(target_os = "linux")]
 mod systemd;
+mod usb_gadget;
 mod video;
 
 use std::net::SocketAddr;

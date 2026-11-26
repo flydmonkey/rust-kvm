@@ -60,3 +60,7 @@ libc = "0.2"
 # nokhwa 底层就是它，版本跟着 nokhwa 走，不多编译东西。只用来问 VIDIOC_QUERYCAP：
 # UVC 设备会多出一个只能采元数据的 /dev/videoN，nokhwa 照样把它列成摄像头。
 v4l = "0.14"
+
+[dev-dependencies]
+# gadget、镜像目录的测试都对着临时目录跑，代替 configfs 和 /dev
+tempfile = "3"
