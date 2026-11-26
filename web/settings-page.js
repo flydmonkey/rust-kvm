@@ -244,10 +244,22 @@
             // 顺序要紧：先铺列表再套配置，否则 selectOrKeep 插的占位项会被冲掉
             renderConfig();
             loadCapabilities();
+            loadGadgetHint();
         } catch (e) {
             saveStatus.textContent = `读不到设备或配置：${e.message || e}`;
             saveStatus.className = "error";
         }
+    }
+
+    async function loadGadgetHint() {
+        const hint = el("gadget-hint");
+        try {
+            const response = await fetch("/api/usb", {cache: "no-store"});
+            hint.textContent = response.ok ? UsbMedia.unavailableHint(await response.json()) : "";
+        } catch (e) {
+            hint.textContent = "";
+        }
+        hint.hidden = !hint.textContent;
     }
 
     async function putConfig(next) {
