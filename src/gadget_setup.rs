@@ -4,7 +4,10 @@
 //! 服务启动——gadget 用不了时，画面和 CH9329 键鼠照样要能用。结构见设计文档
 //! `docs/superpowers/specs/2026-11-26-usb-gadget-design.md`.
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::fs::Permissions;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -12,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::usb_gadget::{
-    ABS_MOUSE_FUNCTION, CONFIG_DIR, GadgetPaths, HID_FUNCTIONS, KEYBOARD_FUNCTION,
+    ABS_MOUSE_FUNCTION, CONFIG_DIR, GADGET_NAME, GadgetPaths, HID_FUNCTIONS, KEYBOARD_FUNCTION,
     REL_MOUSE_FUNCTION, STORAGE_FUNCTION, Slot,
 };
 
@@ -62,6 +65,13 @@ const HIDS: [HidFunction; 3] = [
 ];
 
 pub fn run(user: Option<&str>) -> Result<()> {
+    let paths = GadgetPaths::system();
+    let result = setup(user, &paths);
+    record_outcome(&paths, &result);
+    result
+}
+
+fn setup(user: Option<&str>, paths: &GadgetPaths) -> Result<()> {
     let user = user.context("用法：rust-kvm usb-gadget-setup <服务用户>")?;
     let arch = std::env::consts::ARCH;
     if !matches!(arch, "aarch64" | "arm") {
@@ -70,24 +80,48 @@ pub fn run(user: Option<&str>) -> Result<()> {
     }
     // 编进内核的话 modprobe 会失败，那不要紧，下面看 configfs 目录在不在
     let _ = Command::new("modprobe").arg("libcomposite").status();
-    let paths = GadgetPaths::system();
     if !paths.configfs.is_dir() {
         println!("没有 {}，跳过", paths.configfs.display());
         return Ok(());
     }
-    let Some(udc) = first_udc(&paths.udc_class) else {
+    let Some(udc) = pick_udc(paths)? else {
         println!("没有 USB 设备控制器，跳过");
         return Ok(());
     };
     let owner = lookup_user(user)?;
     if paths.gadget().exists() {
-        teardown(&paths).context("拆掉上次的 gadget 失败")?;
+        teardown(paths).context("拆掉上次的 gadget 失败")?;
     }
-    build(&paths, &serial_number())?;
+    build(paths, &serial_number())?;
     std::fs::write(paths.gadget().join("UDC"), &udc).with_context(|| format!("绑定 {udc} 失败"))?;
-    hand_over(&paths, owner, Duration::from_secs(3))?;
+    hand_over(paths, owner, Duration::from_secs(3))?;
     println!("gadget 已绑定到 {udc}，交给用户 {user}");
     Ok(())
+}
+
+/// `ExecStartPre` 的 stdout 只进 journal，设置页看不到。把失败原因落在文件里，服务启动后读。
+/// 成功就删掉，免得一次早已修好的失败一直挂在设置页上。
+fn record_outcome(paths: &GadgetPaths, result: &Result<()>) {
+    let file = &paths.setup_error;
+    match result {
+        Ok(()) => {
+            let _ = std::fs::remove_file(file);
+        }
+        Err(error) => {
+            if let Err(write_error) = write_setup_error(file, &format!("{error:#}\n")) {
+                eprintln!("记录 setup 失败原因到 {} 失败：{write_error}", file.display());
+            }
+        }
+    }
+}
+
+fn write_setup_error(file: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o755).create(dir)?;
+        std::fs::set_permissions(dir, Permissions::from_mode(0o755))?;
+    }
+    std::fs::write(file, text)?;
+    std::fs::set_permissions(file, Permissions::from_mode(0o644))
 }
 
 /// 属性文件用 `fs::write`（带 create）：configfs 里它们已经存在，测试的临时目录里不存在。
@@ -129,24 +163,50 @@ pub fn build(paths: &GadgetPaths, serial: &str) -> Result<()> {
 }
 
 /// hidg 节点由 udev 在绑定之后才建出来，所以要等。
+///
+/// 尽力而为：每个节点、每个属性都试，失败的汇总成一个错误。LUN 属性按内核有什么交什么
+/// （老内核没有 `forced_eject`），任何一项失败都不该连累键鼠节点。
 pub fn hand_over(paths: &GadgetPaths, owner: (u32, u32), timeout: Duration) -> Result<()> {
-    for slot in Slot::ALL {
-        for attr in ["file", "ro", "forced_eject"] {
-            chown(&paths.lun(slot).join(attr), owner)?;
-        }
-    }
+    let mut failures = Vec::new();
     let deadline = Instant::now() + timeout;
     for function in HID_FUNCTIONS {
-        let node = paths.hid_node(function)?;
-        while !node.exists() {
-            if Instant::now() >= deadline {
-                bail!("等了 {timeout:?} 还没有 {}（udev 没建出来？）", node.display());
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if let Err(error) = hand_over_node(paths, function, owner, deadline, timeout) {
+            failures.push(format!("{error:#}"));
         }
-        chown(&node, owner)?;
     }
-    Ok(())
+    for slot in Slot::ALL {
+        for attr in ["file", "ro", "forced_eject"] {
+            let path = paths.lun(slot).join(attr);
+            if !path.exists() {
+                continue;
+            }
+            if let Err(error) = chown(&path, owner) {
+                failures.push(format!("{error:#}"));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("交给服务用户时有 {} 处失败：{}", failures.len(), failures.join("；"))
+    }
+}
+
+fn hand_over_node(
+    paths: &GadgetPaths,
+    function: &str,
+    owner: (u32, u32),
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<()> {
+    let node = paths.hid_node(function)?;
+    while !node.exists() {
+        if Instant::now() >= deadline {
+            bail!("等了 {timeout:?} 还没有 {}（udev 没建出来？）", node.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    chown(&node, owner)
 }
 
 /// 和建的顺序反过来。configfs 里只能 rmdir，不能删文件；`lun.0` 随功能目录一起没。
@@ -196,14 +256,48 @@ fn chown(path: &Path, (uid, gid): (u32, u32)) -> Result<()> {
         .with_context(|| format!("chown {} 失败", path.display()))
 }
 
-fn first_udc(dir: &Path) -> Option<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+/// 挑一个没被别的 gadget 占着的控制器。板子上要是已经有别的 gadget（比如厂商的 ADB）绑着
+/// 唯一的控制器，抢过来会把它拆掉。自己上次建的不算占用：下面会先拆掉重建。
+fn pick_udc(paths: &GadgetPaths) -> Result<Option<String>> {
+    let Ok(entries) = std::fs::read_dir(&paths.udc_class) else {
+        return Ok(None);
+    };
+    let mut controllers: Vec<String> =
+        entries.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+    controllers.sort();
+    if controllers.is_empty() {
+        return Ok(None);
+    }
+    let occupied = occupied_udcs(paths);
+    if let Some(free) = controllers.iter().find(|name| !occupied.contains_key(*name)) {
+        return Ok(Some(free.clone()));
+    }
+    let detail: Vec<String> = controllers
+        .iter()
+        .map(|name| format!("{name} 被 gadget「{}」占用", occupied[name]))
         .collect();
-    names.sort();
-    names.into_iter().next()
+    bail!("所有 USB 设备控制器都被别的 gadget 占着：{}", detail.join("，"))
+}
+
+/// 控制器名 → 占着它的 gadget 目录名。
+fn occupied_udcs(paths: &GadgetPaths) -> BTreeMap<String, String> {
+    let mut occupied = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(&paths.configfs) else {
+        return occupied;
+    };
+    for entry in entries.flatten() {
+        let gadget = entry.file_name().to_string_lossy().into_owned();
+        if gadget == GADGET_NAME {
+            continue;
+        }
+        if let Ok(udc) = std::fs::read_to_string(entry.path().join("UDC")) {
+            let udc = udc.trim();
+            if !udc.is_empty() {
+                occupied.insert(udc.to_string(), gadget);
+            }
+        }
+    }
+    occupied
 }
 
 fn lookup_user(name: &str) -> Result<(u32, u32)> {
@@ -279,6 +373,7 @@ mod tests {
             configfs: temp.path().join("usb_gadget"),
             udc_class: temp.path().join("udc"),
             dev: temp.path().join("dev"),
+            setup_error: temp.path().join("run/gadget-setup.err"),
         };
         build(&paths, "0123456789abcdef").unwrap();
         let gadget = paths.gadget();
@@ -306,19 +401,118 @@ mod tests {
         }
     }
 
+    fn me() -> (u32, u32) {
+        unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+
+    fn not_root() -> bool {
+        unsafe { libc::geteuid() != 0 }
+    }
+
     #[test]
     fn 交出去的文件包括三个_hidg_节点() {
         let fixture = fixture();
-        let me = unsafe { (libc::geteuid(), libc::getegid()) };
-        hand_over(&fixture.paths, me, Duration::from_millis(100)).unwrap();
+        hand_over(&fixture.paths, me(), Duration::from_millis(100)).unwrap();
+    }
+
+    #[test]
+    fn 老内核没有_forced_eject_照样交出去() {
+        let fixture = fixture();
+        for slot in Slot::ALL {
+            std::fs::remove_file(fixture.paths.lun(slot).join("forced_eject")).unwrap();
+        }
+        hand_over(&fixture.paths, me(), Duration::from_millis(100)).unwrap();
+        assert!(!fixture.paths.lun(Slot::Disk).join("forced_eject").exists());
     }
 
     #[test]
     fn hidg_节点迟迟不出现就报错() {
         let fixture = fixture();
         std::fs::remove_file(fixture.paths.dev.join("hidg2")).unwrap();
-        let me = unsafe { (libc::geteuid(), libc::getegid()) };
-        let error = hand_over(&fixture.paths, me, Duration::from_millis(100)).unwrap_err();
+        let error = hand_over(&fixture.paths, me(), Duration::from_millis(100)).unwrap_err();
         assert!(format!("{error:#}").contains("hidg2"), "{error:#}");
+    }
+
+    #[test]
+    fn 一个节点失败不挡其他的_失败汇总成一个错误() {
+        let fixture = fixture();
+        std::fs::remove_file(fixture.paths.dev.join("hidg2")).unwrap();
+        std::fs::remove_file(fixture.paths.dev.join("hidg0")).unwrap();
+        let error = format!("{:#}", hand_over(&fixture.paths, me(), Duration::from_millis(100)).unwrap_err());
+        assert!(error.contains("hidg2") && error.contains("hidg0"), "{error}");
+        assert!(error.contains("2 处"), "{error}");
+    }
+
+    #[test]
+    fn chown_失败后还继续试后面的() {
+        if !not_root() {
+            return;
+        }
+        let fixture = fixture();
+        // 非 root 不能把文件交给别人：3 个节点 + 2 个 LUN 的 3 个属性 = 9 处全部失败，
+        // 每一处都得试到
+        let other = (me().0 + 1, me().1);
+        let error = format!("{:#}", hand_over(&fixture.paths, other, Duration::from_millis(100)).unwrap_err());
+        assert!(error.contains("9 处"), "{error}");
+        assert!(error.contains("hidg1") && error.contains("lun.1"), "{error}");
+    }
+
+    fn set_udc(paths: &GadgetPaths, gadget: &str, udc: &str) {
+        let dir = paths.configfs.join(gadget);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("UDC"), format!("{udc}\n")).unwrap();
+    }
+
+    fn add_controller(paths: &GadgetPaths, name: &str) {
+        std::fs::create_dir_all(paths.udc_class.join(name)).unwrap();
+    }
+
+    #[test]
+    fn 选控制器时跳过别的_gadget_占着的() {
+        let fixture = fixture();
+        add_controller(&fixture.paths, "ff400000.usb");
+        set_udc(&fixture.paths, "g1", "fe800000.usb");
+        assert_eq!(pick_udc(&fixture.paths).unwrap().as_deref(), Some("ff400000.usb"));
+    }
+
+    #[test]
+    fn 自己上次占着的控制器不算被占用() {
+        let fixture = fixture();
+        assert_eq!(pick_udc(&fixture.paths).unwrap().as_deref(), Some("fe800000.usb"));
+    }
+
+    #[test]
+    fn 控制器全被别的_gadget_占着时点名() {
+        let fixture = fixture();
+        set_udc(&fixture.paths, "g_adb", "fe800000.usb");
+        let error = format!("{:#}", pick_udc(&fixture.paths).unwrap_err());
+        assert!(error.contains("g_adb") && error.contains("fe800000.usb"), "{error}");
+    }
+
+    #[test]
+    fn 没有控制器时是_none() {
+        let fixture = fixture();
+        std::fs::remove_dir_all(fixture.paths.udc_class.join("fe800000.usb")).unwrap();
+        assert_eq!(pick_udc(&fixture.paths).unwrap(), None);
+    }
+
+    #[test]
+    fn 失败时把错误链写进文件_成功时删掉() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("run/rust-kvm/gadget-setup.err");
+        let mut paths = fixture().paths;
+        paths.setup_error = file.clone();
+
+        let failed: Result<()> = Err(anyhow::anyhow!("底层原因").context("绑定失败"));
+        record_outcome(&paths, &failed);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("绑定失败") && text.contains("底层原因"), "{text}");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o644);
+        assert_eq!(mode(file.parent().unwrap()), 0o755);
+
+        record_outcome(&paths, &Ok(()));
+        assert!(!file.exists());
+        record_outcome(&paths, &Ok(()));
     }
 }

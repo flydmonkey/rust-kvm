@@ -6,8 +6,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -35,6 +35,8 @@ pub struct GadgetPaths {
     pub configfs: PathBuf,
     pub udc_class: PathBuf,
     pub dev: PathBuf,
+    /// setup 失败时把原因写在这里，服务启动后据此告诉用户为什么用不了
+    pub setup_error: PathBuf,
 }
 
 impl GadgetPaths {
@@ -43,6 +45,7 @@ impl GadgetPaths {
             configfs: PathBuf::from("/sys/kernel/config/usb_gadget"),
             udc_class: PathBuf::from("/sys/class/udc"),
             dev: PathBuf::from("/dev"),
+            setup_error: PathBuf::from("/run/rust-kvm/gadget-setup.err"),
         }
     }
 
@@ -133,8 +136,18 @@ pub fn detect(paths: &GadgetPaths, arch: &str) -> Availability {
     }
     match UsbGadget::open(paths.clone()) {
         Ok(gadget) => Availability::Ready(Arc::new(gadget)),
-        Err(error) => Availability::Unavailable(format!("{error:#}")),
+        Err(error) => Availability::Unavailable(match setup_failure(paths) {
+            Some(failure) => format!("上次 setup 失败：{failure}"),
+            None => format!("{error:#}"),
+        }),
     }
+}
+
+/// setup 成功时会删掉这个文件，所以它在就说明最近一次 setup 是失败的。
+fn setup_failure(paths: &GadgetPaths) -> Option<String> {
+    let text = std::fs::read_to_string(&paths.setup_error).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 pub struct UsbGadget {
@@ -144,6 +157,10 @@ pub struct UsbGadget {
     abs_mouse: File,
     rel_mouse: File,
     leds: AtomicU8,
+    /// 5.19 以前的内核没有 `forced_eject`
+    forced_eject: bool,
+    /// 串行化对 LUN 属性的多步写：并发的挂盘和弹盘交错起来会写出半挂半弹的状态
+    lun_lock: Mutex<()>,
 }
 
 impl UsbGadget {
@@ -159,17 +176,19 @@ impl UsbGadget {
         if udc.is_empty() {
             bail!("gadget 没有绑定到 USB 控制器。{REINSTALL}");
         }
-        for slot in Slot::ALL {
-            let eject = paths.lun(slot).join("forced_eject");
-            OpenOptions::new().write(true).open(&eject).with_context(|| {
-                format!("写不了 {}，setup 没把它交给服务用户。{REINSTALL}", eject.display())
-            })?;
+        let forced_eject = Slot::ALL.iter().all(|slot| {
+            OpenOptions::new().write(true).open(paths.lun(*slot).join("forced_eject")).is_ok()
+        });
+        if !forced_eject {
+            debug!("内核没有 forced_eject（或写不了），弹盘直接写 file");
         }
         Ok(Self {
             keyboard: open_hid(&paths, KEYBOARD_FUNCTION)?,
             abs_mouse: open_hid(&paths, ABS_MOUSE_FUNCTION)?,
             rel_mouse: open_hid(&paths, REL_MOUSE_FUNCTION)?,
             leds: AtomicU8::new(0),
+            forced_eject,
+            lun_lock: Mutex::new(()),
             udc,
             paths,
         })
@@ -211,8 +230,10 @@ impl UsbGadget {
         let mut buf = [0u8; 8];
         loop {
             match sys::read_report(&self.keyboard, &mut buf, Duration::from_millis(500)) {
-                Ok(0) => std::thread::sleep(Duration::from_millis(100)),
-                Ok(_) => self.leds.store(buf[0], Ordering::Relaxed),
+                // 超时是常态，直接进下一轮；只有读到 0 字节（对端关了）才歇一下，免得空转
+                Ok(None) => {}
+                Ok(Some(0)) => std::thread::sleep(Duration::from_millis(100)),
+                Ok(Some(_)) => self.leds.store(buf[0], Ordering::Relaxed),
                 Err(error) => {
                     debug!("读键盘灯失败：{error}");
                     std::thread::sleep(Duration::from_millis(500));
@@ -233,21 +254,31 @@ impl UsbGadget {
         }
     }
 
-    /// 先强制弹出：被控机锁着介质（Windows 打开过光驱就会锁）时直接写 `file` 会 EBUSY；
+    /// 先弹出：被控机锁着介质（Windows 打开过光驱就会锁）时直接写 `file` 会 EBUSY；
     /// `ro` 也只能在空槽时改。光驱的只读在 setup 时就定了，这里不碰。
     pub fn mount(&self, slot: Slot, image: &Path, read_only: bool) -> Result<()> {
+        let _guard = self.lun_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let lun = self.paths.lun(slot);
-        write_attr(&lun.join("forced_eject"), "1")?;
+        self.close_medium(&lun)?;
         if slot == Slot::Disk {
             write_attr(&lun.join("ro"), if read_only { "1" } else { "0" })?;
         }
-        write_attr(&lun.join("file"), &image.to_string_lossy())
+        write_file_attr(&lun.join("file"), &image.to_string_lossy())
     }
 
     pub fn eject(&self, slot: Slot) -> Result<()> {
-        let lun = self.paths.lun(slot);
-        write_attr(&lun.join("forced_eject"), "1")?;
-        write_attr(&lun.join("file"), "")
+        let _guard = self.lun_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.close_medium(&self.paths.lun(slot))
+    }
+
+    /// 有 `forced_eject` 就用它（连被控机锁住的也能弹）；没有就写 `file`。内核的
+    /// `fsg_store_file` 会去掉结尾的一个换行，空串即弹出——写字节数为 0 的
+    /// 空串根本不会发 write 系统调用，所以要写 `"\n"`。
+    fn close_medium(&self, lun: &Path) -> Result<()> {
+        if self.forced_eject {
+            write_attr(&lun.join("forced_eject"), "1")?;
+        }
+        write_file_attr(&lun.join("file"), "\n")
     }
 }
 
@@ -258,14 +289,25 @@ fn open_hid(paths: &GadgetPaths, function: &str) -> Result<File> {
 }
 
 /// configfs 的属性文件一定已经存在，不带 create：写错路径时要报错，不能悄悄建个新文件。
+fn write_raw(path: &Path, value: &str) -> io::Result<()> {
+    OpenOptions::new().write(true).truncate(true).open(path)?.write_all(value.as_bytes())
+}
+
 fn write_attr(path: &Path, value: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .with_context(|| format!("打开 {} 失败", path.display()))?;
-    file.write_all(value.as_bytes())
-        .with_context(|| format!("写 {} 失败", path.display()))
+    write_raw(path, value).with_context(|| format!("写 {} 失败", path.display()))
+}
+
+fn write_file_attr(path: &Path, value: &str) -> Result<()> {
+    write_raw(path, value).map_err(|error| file_write_error(path, error))
+}
+
+/// 主机禁止了介质移除时，内核对 `file` 的写返回 EBUSY。
+fn file_write_error(path: &Path, error: io::Error) -> anyhow::Error {
+    if error.kind() == io::ErrorKind::ResourceBusy {
+        anyhow::anyhow!("被控机锁住了介质，先在被控机上弹出")
+    } else {
+        anyhow::Error::new(error).context(format!("写 {} 失败", path.display()))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -310,13 +352,14 @@ mod sys {
         }
     }
 
-    pub fn read_report(mut file: &File, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+    /// `None` 是等到超时也没有数据；`Some(0)` 才是真的读到了 0 字节。
+    pub fn read_report(mut file: &File, buf: &mut [u8], timeout: Duration) -> io::Result<Option<usize>> {
         if !wait(file, libc::POLLIN, timeout)? {
-            return Ok(0);
+            return Ok(None);
         }
         match file.read(buf) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
-            other => other,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            other => other.map(Some),
         }
     }
 }
@@ -340,7 +383,7 @@ mod sys {
         Err(unsupported())
     }
 
-    pub fn read_report(_file: &File, _buf: &mut [u8], _timeout: Duration) -> io::Result<usize> {
+    pub fn read_report(_file: &File, _buf: &mut [u8], _timeout: Duration) -> io::Result<Option<usize>> {
         Err(unsupported())
     }
 }
@@ -362,6 +405,7 @@ pub(crate) mod test_support {
             configfs: temp.path().join("usb_gadget"),
             udc_class: temp.path().join("udc"),
             dev: temp.path().join("dev"),
+            setup_error: temp.path().join("run/gadget-setup.err"),
         };
         let udc = paths.udc_class.join("fe800000.usb");
         std::fs::create_dir_all(&udc).unwrap();
@@ -494,9 +538,109 @@ mod tests {
 
     #[test]
     fn 弹出后槽是空的() {
-        let (_fixture, gadget) = test_support::gadget();
+        let (fixture, gadget) = test_support::gadget();
         gadget.mount(Slot::Disk, Path::new("/images/a.img"), false).unwrap();
         gadget.eject(Slot::Disk).unwrap();
         assert_eq!(gadget.slot(Slot::Disk).image, None);
+        // 空串不会发 write，内核收不到弹出；必须是一个换行
+        let raw = std::fs::read_to_string(fixture.paths.lun(Slot::Disk).join("file")).unwrap();
+        assert_eq!(raw, "\n");
+    }
+
+    fn without_forced_eject() -> (test_support::Fixture, Arc<UsbGadget>) {
+        let fixture = fixture();
+        for slot in Slot::ALL {
+            std::fs::remove_file(fixture.paths.lun(slot).join("forced_eject")).unwrap();
+        }
+        let gadget = Arc::new(UsbGadget::open(fixture.paths.clone()).unwrap());
+        (fixture, gadget)
+    }
+
+    #[test]
+    fn 没有_forced_eject_的内核照样能打开和挂盘弹盘() {
+        let (fixture, gadget) = without_forced_eject();
+        assert!(!gadget.forced_eject);
+        gadget.write_report(HidTarget::Keyboard, &[0; 8]).unwrap();
+
+        gadget.mount(Slot::Disk, Path::new("/images/a.img"), true).unwrap();
+        let lun = fixture.paths.lun(Slot::Disk);
+        assert!(!lun.join("forced_eject").exists());
+        assert_eq!(std::fs::read_to_string(lun.join("ro")).unwrap(), "1");
+        assert_eq!(gadget.slot(Slot::Disk).image, Some(PathBuf::from("/images/a.img")));
+
+        gadget.eject(Slot::Disk).unwrap();
+        assert_eq!(std::fs::read_to_string(lun.join("file")).unwrap(), "\n");
+        assert_eq!(gadget.slot(Slot::Disk).image, None);
+    }
+
+    #[test]
+    fn 有_forced_eject_时记下来() {
+        let (_fixture, gadget) = test_support::gadget();
+        assert!(gadget.forced_eject);
+    }
+
+    #[test]
+    fn 写_file_得到_ebusy_时提示在被控机上弹出() {
+        let busy = io::Error::from(io::ErrorKind::ResourceBusy);
+        let message = format!("{:#}", file_write_error(Path::new("/x/file"), busy));
+        assert!(message.contains("被控机锁住了介质"), "{message}");
+        let other = io::Error::from(io::ErrorKind::PermissionDenied);
+        let message = format!("{:#}", file_write_error(Path::new("/x/file"), other));
+        assert!(message.contains("/x/file"), "{message}");
+    }
+
+    #[test]
+    fn 挂盘持有锁时别的写要等() {
+        let (fixture, gadget) = test_support::gadget();
+        let guard = gadget.lun_lock.lock().unwrap();
+        let worker = {
+            let gadget = gadget.clone();
+            std::thread::spawn(move || gadget.mount(Slot::Cdrom, Path::new("/images/a.iso"), false))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let file = fixture.paths.lun(Slot::Cdrom).join("file");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+        drop(guard);
+        worker.join().unwrap().unwrap();
+        assert_eq!(gadget.slot(Slot::Cdrom).image, Some(PathBuf::from("/images/a.iso")));
+    }
+
+    #[test]
+    fn setup_失败过时原因用记下的内容() {
+        let fixture = fixture();
+        std::fs::remove_dir_all(fixture.paths.gadget()).unwrap();
+        std::fs::create_dir_all(fixture.paths.setup_error.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.paths.setup_error, "绑定 fe800000.usb 失败: busy\n").unwrap();
+        let reason = reason(detect(&fixture.paths, "aarch64")).unwrap();
+        assert_eq!(reason, "上次 setup 失败：绑定 fe800000.usb 失败: busy");
+    }
+
+    #[test]
+    fn 记下的失败原因是空的就退回通用提示() {
+        let fixture = fixture();
+        std::fs::remove_dir_all(fixture.paths.gadget()).unwrap();
+        std::fs::create_dir_all(fixture.paths.setup_error.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.paths.setup_error, "\n").unwrap();
+        let reason = reason(detect(&fixture.paths, "aarch64")).unwrap();
+        assert!(reason.contains("rust-kvm install"), "{reason}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn 没数据超时是_none_读到零字节才是_some_0() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (reader, writer) =
+            unsafe { (File::from(OwnedFd::from_raw_fd(fds[0])), File::from(OwnedFd::from_raw_fd(fds[1]))) };
+        let mut buf = [0u8; 8];
+        let timeout = Duration::from_millis(10);
+        assert_eq!(sys::read_report(&reader, &mut buf, timeout).unwrap(), None);
+        (&writer).write_all(&[0x02]).unwrap();
+        assert_eq!(sys::read_report(&reader, &mut buf, timeout).unwrap(), Some(1));
+        assert_eq!(buf[0], 0x02);
+        drop(writer);
+        assert_eq!(sys::read_report(&reader, &mut buf, timeout).unwrap(), Some(0));
     }
 }
