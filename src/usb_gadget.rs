@@ -157,7 +157,7 @@ pub struct UsbGadget {
     abs_mouse: File,
     rel_mouse: File,
     leds: AtomicU8,
-    /// 5.19 以前的内核没有 `forced_eject`
+    /// 老内核（包括不少 RK 的 5.10 BSP）没有 `forced_eject`
     forced_eject: bool,
     /// 串行化对 LUN 属性的多步写：并发的挂盘和弹盘交错起来会写出半挂半弹的状态
     lun_lock: Mutex<()>,
