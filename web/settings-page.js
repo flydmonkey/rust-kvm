@@ -46,6 +46,13 @@
     const saveStatus = el("save-status");
     const chipStatus = el("chip-status");
     const chipButtons = [el("chip-read"), el("chip-baud"), el("chip-mode"), el("chip-reset")];
+    // 本机 USB 口直连的假端口。选它时没有芯片可读写，芯片那一节整个藏起来
+    const GADGET_PORT = "usb-gadget";
+    const chipSection = el("chip-section");
+
+    function renderChipSection() {
+        chipSection.hidden = serialPort.value === GADGET_PORT;
+    }
 
     let config = null;
 
@@ -136,10 +143,12 @@
         showProblem("serial-problem", devices.serial.error);
 
         fill(atxPort, [{value: "", label: "不使用"}].concat(
-            devices.serial.items.map((item) => ({
-                value: item.name,
-                label: item.description ? `${item.name} — ${item.description}` : item.name
-            }))
+            devices.serial.items
+                .filter((item) => item.name !== GADGET_PORT)
+                .map((item) => ({
+                    value: item.name,
+                    label: item.description ? `${item.name} — ${item.description}` : item.name
+                }))
         ));
     }
 
@@ -175,6 +184,7 @@
         audioNarrowband.checked = config.audio.narrowband;
 
         selectOrKeep(serialPort, config.serial.port);
+        renderChipSection();
         selectOrKeep(serialBaud, String(config.serial.baudRate));
         mouseMode.value = config.serial.mouseMode;
 
@@ -906,6 +916,7 @@
         Atx.CHANNELS.map((n) => ({value: String(n), label: `第 ${n} 路`}))
     ));
     atxPort.addEventListener("change", renderAtxState);
+    serialPort.addEventListener("change", renderChipSection);
     atxChannel.addEventListener("change", renderAtxState);
 
     videoCodec.addEventListener("change", renderBitrateState);

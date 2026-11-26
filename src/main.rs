@@ -48,6 +48,7 @@ use audio::{AudioHub, AudioStats};
 use config::{Config, ConfigStore};
 use devices::Devices;
 use serial_bridge::{PortInfo, SerialHub};
+use usb_gadget::{Availability, GadgetPaths};
 use video::{VideoCodec, VideoHub, VideoStats};
 
 /// 局域网访问走这个口，必须是 HTTPS：Keyboard Lock、剪贴板、Pointer Lock
@@ -209,10 +210,24 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
     let store = Arc::new(ConfigStore::load(&root.join("config.json")));
     let settings = store.get();
 
+    let usb = usb_gadget::detect(&GadgetPaths::system(), std::env::consts::ARCH);
+    let gadget = match &usb {
+        Availability::Ready(gadget) => {
+            info!("本机 USB 口可用：虚拟光驱、U 盘和直连键鼠");
+            gadget.spawn_led_reader();
+            Some(gadget.clone())
+        }
+        Availability::Unavailable(reason) => {
+            warn!("本机 USB 口不可用：{reason}");
+            None
+        }
+        Availability::Unsupported => None,
+    };
+
     let state = AppState {
         hub: VideoHub::new(settings.video),
         audio: AudioHub::new(settings.audio),
-        serial: SerialHub::new(),
+        serial: SerialHub::new(gadget),
         atx: AtxRelay::new(),
         config: store,
         cert_pem: Arc::new(cert.cert_pem),
@@ -750,14 +765,18 @@ async fn no_cache(mut response: Response) -> Response {
 }
 
 /// 远程浏览器没有宿主机的 Web Serial 权限，选口只能靠服务端枚举。
-async fn serial_ports() -> Json<Vec<PortInfo>> {
-    Json(serial_bridge::list_ports())
+async fn serial_ports(State(state): State<AppState>) -> Json<Vec<PortInfo>> {
+    let mut ports = serial_bridge::list_ports();
+    state.serial.add_gadget_port(&mut ports);
+    Json(ports)
 }
 
 /// 每次请求都重新枚举，不缓存：设备是会被插拔的，而设置页上那个列表过期了
 /// 就直接导致选不到设备。
-async fn list_devices() -> Json<Devices> {
-    Json(devices::enumerate())
+async fn list_devices(State(state): State<AppState>) -> Json<Devices> {
+    let mut devices = devices::enumerate();
+    state.serial.add_gadget_port(&mut devices.serial.items);
+    Json(devices)
 }
 
 async fn get_config(State(state): State<AppState>) -> Json<Config> {
@@ -780,6 +799,17 @@ async fn put_config(
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "继电器和 CH9329 不能是同一个串口",
+        )
+            .into_response());
+    }
+    if config
+        .atx
+        .as_ref()
+        .is_some_and(|relay| relay.port == serial_bridge::GADGET_PORT)
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "继电器要接真串口，不能选本机 USB 口",
         )
             .into_response());
     }

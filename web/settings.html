@@ -299,6 +299,7 @@
     <section>
         <h2>键鼠</h2>
         <div class="problem" id="serial-problem"></div>
+        <p class="hint" id="gadget-hint" hidden></p>
         <div class="field">
             <label for="serial-port">串口</label>
             <select id="serial-port"></select>
@@ -314,7 +315,7 @@
             相对模式需要芯片工作在模式 2，否则某些被控端点不动。</p>
     </section>
 
-    <section>
+    <section id="chip-section">
         <h2>CH9329 芯片</h2>
         <p class="hint">这一节直接读写芯片，要临时借用串口——别处正连着时会问你要不要
             接管。<strong>写入后都要把 CH9329 断电重插（拔掉 USB 再插回）才生效。</strong></p>
