@@ -152,6 +152,8 @@ pub struct VideoHub {
     /// 下一帧强制 IDR。新订阅者进场、或者有人 `Lagged` 需要重新同步时置位。
     keyframe_wanted: AtomicBool,
     codec: watch::Sender<CodecState>,
+    /// 采集和「实测帧率」都要独占设备。采集持有整段循环；实测只在没人采集时拿得到。
+    device: Mutex<()>,
 }
 
 impl VideoHub {
@@ -176,6 +178,7 @@ impl VideoHub {
                 ..Default::default()
             })
             .0,
+            device: Mutex::new(()),
         });
         tokio::spawn(supervise(hub.clone()));
         tokio::spawn(supervise_encoder(hub.clone()));
@@ -655,6 +658,8 @@ impl Pacer {
 }
 
 fn capture_loop(hub: &VideoHub) -> Result<StopReason> {
+    // 和实测帧率互斥。锁放在读配置之前，免得实测正开着设备时这边先把配置标志清掉。
+    let _device = hub.device.lock().expect("采集设备锁");
     // 先清标志再读配置。顺序反了的话，这两步之间的一次保存会被当成「已处理」
     // 而丢掉；现在这个顺序最坏也只是多重开一次，那没有坏处。
     hub.reconfigured.store(false, Ordering::SeqCst);
@@ -790,6 +795,138 @@ fn jpeg_len(buf: &[u8]) -> Option<usize> {
     }
 }
 
+/// 设置页用来标分辨率。`error` 有内容时 `modes` 为空，页面照样能显示原因。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureCapabilities {
+    pub device: String,
+    pub modes: Vec<CaptureMode>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureMode {
+    pub size: String,
+    pub rates: Vec<u32>,
+}
+
+pub fn list_capabilities(hint: &str) -> CaptureCapabilities {
+    match list_capabilities_inner(hint) {
+        Ok((device, modes)) => CaptureCapabilities {
+            device,
+            modes,
+            error: None,
+        },
+        Err(error) => CaptureCapabilities {
+            device: hint.to_string(),
+            modes: Vec::new(),
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn list_capabilities_inner(hint: &str) -> Result<(String, Vec<CaptureMode>)> {
+    let index = pick_device(hint)?;
+    let devices = crate::camera::capture_devices()?;
+    let name = devices
+        .iter()
+        .find(|info| info.index() == &index)
+        .map(|info| info.human_name())
+        .unwrap_or_else(|| hint.to_string());
+    let index = index.as_index().context("设备索引不是数字")?;
+    let modes = crate::camera::mjpeg_modes(index)?
+        .into_iter()
+        .map(|mode| CaptureMode {
+            size: format!("{}x{}", mode.width, mode.height),
+            rates: mode.rates,
+        })
+        .collect();
+    Ok((name, modes))
+}
+
+pub enum MeasureError {
+    /// 采集线程正占着设备
+    Busy,
+    Failed(anyhow::Error),
+}
+
+/// 按请求的分辨率和帧率开流，数约 1.5 秒里**非空** JPEG 有多少。
+///
+/// 能力表会撒谎：MS2109 的 1080p60 每隔一帧是一个 4 字节空 JPEG，真画面还是 30。
+/// 空帧不计入，得到的才是设置页该标的数。采集正在跑时不抢设备。
+pub fn measure_fps(
+    hub: &VideoHub,
+    hint: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<u32, MeasureError> {
+    let Ok(_device) = hub.device.try_lock() else {
+        return Err(MeasureError::Busy);
+    };
+    let index = pick_device(hint).map_err(MeasureError::Failed)?;
+    sample_fps(index, width, height, fps).map_err(MeasureError::Failed)
+}
+
+fn sample_fps(index: CameraIndex, width: u32, height: u32, fps: u32) -> Result<u32> {
+    let wanted = CameraFormat::new(
+        Resolution::new(width, height),
+        FrameFormat::MJPEG,
+        fps.max(1),
+    );
+    let mut camera = Camera::new(
+        index,
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(wanted)),
+    )
+    .context("打开采集卡失败（是否被别的程序占用？）")?;
+    camera.open_stream().context("开流失败")?;
+
+    // MS2109 刚换格式时要稳一会儿：1080p 切到 720p60 后头一秒多只出十几帧，之后才到
+    // 60。所以连数两段取大的——头一段没稳也不会把一档好好的帧率标成不够。
+    let started = Instant::now();
+    let warmup = Duration::from_millis(500);
+    let window = Duration::from_millis(1500);
+    const WINDOWS: u32 = 2;
+    // frame_raw 本身会堵到下一帧。过了这个点还堵着，就当卡死，别一直占着设备
+    let deadline = started + warmup + window * WINDOWS + Duration::from_secs(2);
+    let mut origin: Option<Instant> = None;
+    let mut frames = 0u32;
+    let mut best = 0u32;
+    let mut done = 0u32;
+    while done < WINDOWS {
+        if Instant::now() > deadline {
+            bail!("采集卡没有在时限内给出足够的帧");
+        }
+        let frame = camera.frame_raw().context("取帧失败")?;
+        let now = Instant::now();
+        if now.duration_since(started) < warmup {
+            continue;
+        }
+        let since = *origin.get_or_insert(now);
+        if real_jpeg(&frame) {
+            frames += 1;
+        }
+        let elapsed = now.duration_since(since);
+        if elapsed >= window {
+            best = best.max((frames as f32 / elapsed.as_secs_f32()).round() as u32);
+            done += 1;
+            origin = None;
+            frames = 0;
+        }
+    }
+    let _ = camera.stop_stream();
+    Ok(best)
+}
+
+fn real_jpeg(frame: &[u8]) -> bool {
+    if !frame.starts_with(&[0xFF, 0xD8]) {
+        return false;
+    }
+    let jpeg = &frame[..jpeg_len(frame).unwrap_or(frame.len())];
+    jpeg != EMPTY_JPEG
+}
+
 fn pick_device(hint: &str) -> Result<CameraIndex> {
     let devices = crate::camera::capture_devices()?;
     if devices.is_empty() {
@@ -810,7 +947,7 @@ mod tests {
     use bytes::Bytes;
     use tokio::sync::broadcast;
 
-    use super::{Pacer, jpeg_len, newest_jpeg};
+    use super::{Pacer, jpeg_len, newest_jpeg, real_jpeg};
 
     #[test]
     fn newest_jpeg_skips_queued_frames() {
@@ -911,5 +1048,19 @@ mod tests {
     #[test]
     fn 坏的段长度不会卡死() {
         assert_eq!(jpeg_len(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x00, 0xFF, 0xD9]), None);
+        assert!(!real_jpeg(&[0xFF, 0xD8, 0xFF, 0xD9]));
+        assert!(real_jpeg(&fake_jpeg()));
+    }
+
+    #[test]
+    fn 能力表能列出插着的采集卡() {
+        let caps = super::list_capabilities("USB Video");
+        if caps.modes.is_empty() {
+            return;
+        }
+        assert!(caps.error.is_none(), "{:?}", caps.error);
+        assert!(caps.modes.iter().any(|mode| mode.size == "1920x1080"));
+        assert!(caps.modes.iter().any(|mode| mode.size == "1280x720"));
+        assert!(!caps.modes.iter().any(|mode| mode.size == "1600x900"));
     }
 }

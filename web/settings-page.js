@@ -230,6 +230,7 @@
             renderDevices(devices);
             // 顺序要紧：先铺列表再套配置，否则 selectOrKeep 插的占位项会被冲掉
             renderConfig();
+            loadCapabilities();
         } catch (e) {
             saveStatus.textContent = `读不到设备或配置：${e.message || e}`;
             saveStatus.className = "error";
@@ -453,6 +454,7 @@
             el("video-live").textContent = video.error
                 ? `实际 ${resolution}　错误：${video.error}`
                 : `实际 ${resolution}　${video.fps.toFixed(1)} fps　${video.mbps.toFixed(1)} Mbps　观看者 ${video.viewers}`;
+            noteLiveFps(video);
         } catch (e) {
             el("video-live").textContent = "读不到画面状态";
         }
@@ -668,6 +670,223 @@
         await putConfig(next);
     }
 
+    let captureModes = [];
+    let measured = {};
+    let measureGeneration = 0;
+
+    function annotate(option, note) {
+        if (!option.dataset.label) {
+            option.dataset.label = option.textContent;
+        }
+        option.textContent = note ? `${option.dataset.label} — ${note}` : option.dataset.label;
+    }
+
+    function renderCaptureLabels(measuring) {
+        [...videoSize.options].forEach((option) => {
+            annotate(option, CaptureModes.resolutionNote(option.value, captureModes));
+        });
+        const resolution = videoSize.value;
+        [...videoFps.options].forEach((option) => {
+            let note = CaptureModes.frameRateNote(resolution, Number(option.value), measured);
+            if (measuring && option.value === videoFps.value && Number(option.value) > 30) {
+                note = "正在实测…";
+            }
+            annotate(option, note);
+        });
+    }
+
+    function rememberCapture(device) {
+        if (device) {
+            CaptureModes.save(localStorage, device, {modes: captureModes, measured});
+        }
+    }
+
+    function setCaptureHint(text) {
+        const hint = el("capture-hint");
+        hint.textContent = text || "";
+        hint.hidden = !text;
+    }
+
+    function capabilityHint() {
+        if (!captureModes.length) {
+            return "没有查到 MJPEG 格式。";
+        }
+        const largest = captureModes[0].replace("x", "×");
+        return `这张卡有 ${captureModes.length} 档 MJPEG，最大 ${largest}。表里没有的分辨率会退回最接近的一档；高于 30 的帧率按实测标，能力表里的 60 经常是虚的。`;
+    }
+
+    function sameDevice(saved, selected) {
+        if (!saved || !selected) {
+            return false;
+        }
+        return saved === selected || selected.includes(saved) || saved.includes(selected);
+    }
+
+    // 正在采集的那一档，用服务端已经在数的非空帧率。只标当前配置，
+    // 不能把「请求 30 时数到 30」写成「60 也只有 30」。
+    function noteLiveFps(video) {
+        if (!config || !video.capturing || !video.resolution || !(video.fps > 1)) {
+            return;
+        }
+        const size = `${video.resolution[0]}x${video.resolution[1]}`;
+        if (size !== `${config.video.width}x${config.video.height}`) {
+            return;
+        }
+        if (!sameDevice(config.video.device, videoDevice.value)) {
+            return;
+        }
+        const key = CaptureModes.measuredKey(size, config.video.fps);
+        const fps = Math.round(video.fps);
+        if (measured[key] === fps) {
+            return;
+        }
+        measured[key] = fps;
+        rememberCapture(videoDevice.value);
+        renderCaptureLabels(false);
+    }
+
+    // 下拉框列采集卡自己报的档位；还没查到（或查不到）时用常见的几档。
+    // 页面上正选着的值保留，哪怕卡上没有，免得一换设备就把没保存的选择冲掉。
+    function fillResolutions() {
+        const keep = videoSize.value
+            || (config ? `${config.video.width}x${config.video.height}` : "");
+        const sizes = captureModes.length
+            ? CaptureModes.resolutionOptions(captureModes)
+            : SIZES.map(([w, h]) => `${w}x${h}`);
+        fill(videoSize, sizes.map((size) => ({value: size, label: size.replace("x", " × ")})));
+        selectOrKeep(videoSize, keep);
+        renderCaptureLabels(false);
+    }
+
+    async function loadCapabilities() {
+        const device = videoDevice.value;
+        const generation = ++measureGeneration;
+        if (!device) {
+            captureModes = [];
+            measured = {};
+            fillResolutions();
+            setCaptureHint("");
+            return;
+        }
+        const cached = CaptureModes.load(localStorage, device);
+        if (cached) {
+            captureModes = cached.modes;
+            measured = Object.assign({}, cached.measured);
+        } else {
+            captureModes = [];
+            measured = {};
+        }
+        fillResolutions();
+        try {
+            const response = await fetch(
+                `/api/video/capabilities?device=${encodeURIComponent(device)}`,
+                {cache: "no-store"}
+            );
+            if (generation !== measureGeneration || device !== videoDevice.value) {
+                return;
+            }
+            if (response.status === 404) {
+                setCaptureHint("服务还是旧版本，重启后才能检测采集卡。");
+                return;
+            }
+            if (!response.ok) {
+                setCaptureHint(await response.text());
+                return;
+            }
+            const result = await response.json();
+            if (result.error) {
+                setCaptureHint(result.error);
+            } else {
+                captureModes = result.modes.map((mode) => mode.size);
+                setCaptureHint(capabilityHint());
+                rememberCapture(device);
+                fillResolutions();
+            }
+        } catch (e) {
+            if (generation === measureGeneration) {
+                setCaptureHint("读不到采集卡能力");
+            }
+        }
+        if (generation !== measureGeneration) {
+            return;
+        }
+        renderCaptureLabels(false);
+        maybeMeasure(generation, false);
+    }
+
+    async function maybeMeasure(generation, force) {
+        const device = videoDevice.value;
+        const resolution = videoSize.value;
+        const fps = Number(videoFps.value);
+        const size = CaptureModes.parseSize(resolution);
+        if (!device || !size || fps <= 30) {
+            return;
+        }
+        const key = CaptureModes.measuredKey(resolution, fps);
+        if (!force && typeof measured[key] === "number") {
+            return;
+        }
+        let stats;
+        try {
+            stats = await fetch("/api/video/stats", {cache: "no-store"}).then((response) => response.json());
+        } catch (e) {
+            return;
+        }
+        if (generation !== measureGeneration) {
+            return;
+        }
+        const liveSize = stats.resolution ? `${stats.resolution[0]}x${stats.resolution[1]}` : "";
+        if (stats.capturing) {
+            if (liveSize === resolution
+                && config
+                && config.video.fps === fps
+                && stats.fps > 1
+                && sameDevice(config.video.device, device)) {
+                measured[key] = Math.round(stats.fps);
+                rememberCapture(device);
+                renderCaptureLabels(false);
+            } else {
+                setCaptureHint("采集卡正在被控制页使用，这一档的帧率要等没人看再测。正在采集的那一档会用画面状态里的帧率来标。");
+            }
+            return;
+        }
+        const button = el("probe-capture");
+        button.disabled = true;
+        renderCaptureLabels(true);
+        try {
+            const response = await fetch("/api/video/measure", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    device: device,
+                    width: size.width,
+                    height: size.height,
+                    fps: fps
+                })
+            });
+            if (generation !== measureGeneration) {
+                return;
+            }
+            if (!response.ok) {
+                setCaptureHint(await response.text());
+                return;
+            }
+            const body = await response.json();
+            measured[key] = body.fps;
+            rememberCapture(device);
+            setCaptureHint(capabilityHint());
+        } catch (e) {
+            if (generation === measureGeneration) {
+                setCaptureHint("实测帧率失败");
+            }
+        } finally {
+            button.disabled = false;
+            if (generation === measureGeneration) {
+                renderCaptureLabels(false);
+            }
+        }
+    }
+
     fill(videoSize, SIZES.map(([w, h]) => ({value: `${w}x${h}`, label: `${w} × ${h}`})));
     fill(videoFps, FPS.map((fps) => ({value: String(fps), label: `${fps} fps`})));
     fill(videoCodec, CODECS);
@@ -685,6 +904,20 @@
     atxChannel.addEventListener("change", renderAtxState);
 
     videoCodec.addEventListener("change", renderBitrateState);
+    videoDevice.addEventListener("change", loadCapabilities);
+    videoSize.addEventListener("change", () => {
+        renderCaptureLabels(false);
+        maybeMeasure(++measureGeneration, false);
+    });
+    videoFps.addEventListener("change", () => {
+        renderCaptureLabels(false);
+        maybeMeasure(++measureGeneration, false);
+    });
+    el("probe-capture").addEventListener("click", () => {
+        measured = {};
+        rememberCapture(videoDevice.value);
+        loadCapabilities();
+    });
     saveButton.addEventListener("click", () => save());
     reloadButton.addEventListener("click", load);
     el("chip-read").addEventListener("click", readChip);

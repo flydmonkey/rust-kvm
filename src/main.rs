@@ -216,6 +216,8 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         .route("/ws/audio", get(ws_audio))
         .route("/ws/serial", get(ws_serial))
         .route("/api/video/stats", get(video_stats))
+        .route("/api/video/capabilities", get(video_capabilities))
+        .route("/api/video/measure", post(video_measure))
         .route("/api/audio/stats", get(audio_stats))
         .route("/api/serial/ports", get(serial_ports))
         .route("/api/devices", get(list_devices))
@@ -510,6 +512,62 @@ async fn pump_h264(
 
 async fn video_stats(State(state): State<AppState>) -> Json<VideoStats> {
     Json(state.hub.stats())
+}
+
+#[derive(serde::Deserialize)]
+struct DeviceQuery {
+    #[serde(default)]
+    device: String,
+}
+
+/// 能力表。Linux 上只枚举，不打断正在进行的采集。
+async fn video_capabilities(Query(query): Query<DeviceQuery>) -> Json<video::CaptureCapabilities> {
+    Json(video::list_capabilities(&query.device))
+}
+
+#[derive(serde::Deserialize)]
+struct MeasureRequest {
+    #[serde(default)]
+    device: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+}
+
+/// 数一会儿真实画面。采集正开着就拒绝，免得把正在看的人掐掉。
+async fn video_measure(
+    State(state): State<AppState>,
+    Json(request): Json<MeasureRequest>,
+) -> Response {
+    use axum::http::StatusCode;
+    if request.width == 0 || request.height == 0 || request.fps == 0 || request.fps > 240 {
+        return (StatusCode::BAD_REQUEST, "分辨率或帧率不对").into_response();
+    }
+    let hub = state.hub.clone();
+    let device = request.device;
+    let width = request.width;
+    let height = request.height;
+    let fps = request.fps;
+    let measured = tokio::task::spawn_blocking(move || {
+        video::measure_fps(&hub, &device, width, height, fps)
+    })
+    .await;
+    match measured {
+        Ok(Ok(fps)) => Json(serde_json::json!({ "fps": fps })).into_response(),
+        Ok(Err(video::MeasureError::Busy)) => (
+            StatusCode::CONFLICT,
+            "采集卡正在使用。关掉控制页，等没人看之后再测这一档的帧率",
+        )
+            .into_response(),
+        Ok(Err(video::MeasureError::Failed(error))) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("实测线程异常退出: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn ws_audio(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
