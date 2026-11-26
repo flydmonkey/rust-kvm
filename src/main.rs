@@ -10,6 +10,7 @@ mod certs;
 mod config;
 mod devices;
 mod h264;
+mod hid_emulator;
 mod nv12;
 mod serial_bridge;
 #[cfg(windows)]
