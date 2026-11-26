@@ -309,6 +309,22 @@
         collapseButton.setAttribute("aria-label", collapsed ? "展开工具栏" : "收起工具栏");
     });
 
+    // 鼠标点按钮不让它拿焦点。拿了的话，之后按任何键（本来都是发给被控机的）浏览器
+    // 都会把它升格成 :focus-visible，按钮亮框、tooltip 弹出来，看着像焦点跳到了工具栏。
+    // 按键本身不受影响（input.js 在 document 上全拦了），坏的只是样子——但全屏时那块
+    // 亮框正好挂在画面边上。阻止 mousedown 的默认动作只是不聚焦，click 照常触发。
+    // 原先在输入框里的焦点顺手放掉：点了按钮，键盘就该回到被控机。
+    document.addEventListener("mousedown", (event) => {
+        if (!(event.target instanceof Element) || !event.target.closest("button")) {
+            return;
+        }
+        event.preventDefault();
+        const active = document.activeElement;
+        if (active && active !== document.body && active.blur) {
+            active.blur();
+        }
+    }, {capture: true});
+
     renderFullscreen();
     renderRecord(false);
 })();
