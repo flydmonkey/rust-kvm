@@ -34,6 +34,8 @@ pub struct Output {
 #[derive(Default)]
 pub struct Emulator {
     pending: Vec<u8>,
+    /// 绝对鼠标不像相对鼠标，松键要带着坐标，所以得记着最后一份
+    last_abs: Option<Vec<u8>>,
 }
 
 const HEAD: [u8; 2] = [0x57, 0xAB];
@@ -109,7 +111,28 @@ impl Emulator {
             let frame: Vec<u8> = self.pending.drain(..total).collect();
             handle(cmd, &frame[5..5 + len], status, &mut out);
         }
+        if let Some((_, report)) = out.reports.iter().rev().find(|(target, _)| *target == HidTarget::AbsMouse) {
+            self.last_abs = Some(report.clone());
+        }
         out
+    }
+
+    /// 控制端断开时要补发的报告：绝对鼠标最后一份要是还按着键，就发一份键松开、坐标不变的。
+    /// 断开时下发的全释放帧只覆盖键盘和相对鼠标，绝对鼠标的键会一直按在被控机上。
+    pub fn release_reports(&self) -> Vec<(HidTarget, Vec<u8>)> {
+        let Some(last) = &self.last_abs else {
+            return Vec::new();
+        };
+        if last.first().is_none_or(|buttons| *buttons == 0) {
+            return Vec::new();
+        }
+        let mut release = last.clone();
+        release[0] = 0;
+        // 最后一字节是滚轮增量，重发会再滚一次
+        if let Some(wheel) = release.last_mut() {
+            *wheel = 0;
+        }
+        vec![(HidTarget::AbsMouse, release)]
     }
 }
 
@@ -313,5 +336,36 @@ mod tests {
             let out = feed(&frame(cmd, &data));
             assert_eq!(out.replies, frame(cmd | 0x80, &[0x00]), "cmd {cmd:#04x}");
         }
+    }
+
+    #[test]
+    fn 绝对鼠标按着键时断开要补一份松键的报告() {
+        let mut emulator = Emulator::new();
+        assert!(emulator.release_reports().is_empty());
+        emulator.feed(&frame(0x04, &[0x02, 0x01, 0xFF, 0x0F, 0x00, 0x08, 0x05]), &mut status(UsbState::Configured, 0));
+        assert_eq!(
+            emulator.release_reports(),
+            vec![(HidTarget::AbsMouse, vec![0x00, 0xFF, 0x0F, 0x00, 0x08, 0x00])]
+        );
+    }
+
+    #[test]
+    fn 最后一份绝对鼠标报告没按键就不用补() {
+        let mut emulator = Emulator::new();
+        let mut bytes = frame(0x04, &[0x02, 0x01, 0x10, 0x00, 0x10, 0x00, 0x00]);
+        bytes.extend(frame(0x04, &[0x02, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00]));
+        emulator.feed(&bytes, &mut status(UsbState::Configured, 0));
+        assert!(emulator.release_reports().is_empty());
+    }
+
+    #[test]
+    fn 只记绝对鼠标_键盘和相对鼠标不影响() {
+        let mut emulator = Emulator::new();
+        emulator.feed(&frame(0x04, &[0x02, 0x02, 0x34, 0x12, 0x78, 0x05, 0x00]), &mut status(UsbState::Configured, 0));
+        emulator.feed(&frame(0x05, &[0x01, 0x00, 1, 1, 0]), &mut status(UsbState::Configured, 0));
+        assert_eq!(
+            emulator.release_reports(),
+            vec![(HidTarget::AbsMouse, vec![0x00, 0x34, 0x12, 0x78, 0x05, 0x00])]
+        );
     }
 }

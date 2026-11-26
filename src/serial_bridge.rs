@@ -7,7 +7,7 @@
 //! 另一个例外是假端口 `usb-gadget`：选它时不开串口，字节交给服务端的 CH9329 模拟器
 //! （`hid_emulator`），翻成 HID 报告写进本机 USB 口的 `/dev/hidg*`。浏览器那边分不出来。
 
-use crate::hid_emulator::Emulator;
+use crate::hid_emulator::{Emulator, HidTarget};
 use crate::usb_gadget::UsbGadget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -312,17 +312,23 @@ fn emulate(
     while let Ok(bytes) = writes.recv() {
         let started = Instant::now();
         let output = emulator.feed(&bytes, &mut || gadget.status());
-        for (target, report) in &output.reports {
-            if let Err(error) = gadget.write_report(*target, report) {
-                debug!("HID 报告没写进去（被控机没接或没在听）：{error}");
-            }
-        }
+        write_reports(gadget, &output.reports);
         if output.replies.is_empty() {
             continue;
         }
         round_trip_us.store(started.elapsed().as_micros().max(1) as u64, Ordering::Relaxed);
         if reads.blocking_send(Bytes::from(output.replies)).is_err() {
-            return;
+            break;
+        }
+    }
+    // 浏览器断开时发的全释放帧管不到绝对鼠标，这里补上，否则被控机上的键会一直按着
+    write_reports(gadget, &emulator.release_reports());
+}
+
+fn write_reports(gadget: &UsbGadget, reports: &[(HidTarget, Vec<u8>)]) {
+    for (target, report) in reports {
+        if let Err(error) = gadget.write_report(*target, report) {
+            debug!("HID 报告没写进去（被控机没接或没在听）：{error}");
         }
     }
 }
@@ -702,7 +708,7 @@ fn release_all(link: &SerialLink) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usb_gadget::{KEYBOARD_FUNCTION, test_support};
+    use crate::usb_gadget::{ABS_MOUSE_FUNCTION, KEYBOARD_FUNCTION, test_support};
 
     #[test]
     fn 直连口把键盘帧写成_hid_报告并回应答() {
@@ -714,6 +720,27 @@ mod tests {
         assert_eq!(&reply[..], &[0x57, 0xAB, 0x00, 0x82, 0x01, 0x00, 0x85]);
         let node = fixture.paths.hid_node(KEYBOARD_FUNCTION).unwrap();
         assert_eq!(std::fs::read(node).unwrap(), vec![0, 0, 0x04, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn 写通道关闭时补发绝对鼠标的松键报告() {
+        let (fixture, gadget) = test_support::gadget();
+        let (link, mut replies) = SerialLink::open_gadget(gadget, 9600).unwrap();
+        let mut frame = vec![0x57, 0xAB, 0x00, 0x04, 0x07, 0x02, 0x01, 0xFF, 0x0F, 0x00, 0x08, 0x00];
+        let sum = frame.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        frame.push(sum);
+        assert!(link.write(Bytes::from(frame)));
+        replies.blocking_recv().unwrap();
+
+        let SerialLink { writes, finished, .. } = link;
+        drop(writes);
+        finished.blocking_recv().unwrap();
+
+        let node = fixture.paths.hid_node(ABS_MOUSE_FUNCTION).unwrap();
+        assert_eq!(
+            std::fs::read(node).unwrap(),
+            vec![0x01, 0xFF, 0x0F, 0x00, 0x08, 0x00, 0x00, 0xFF, 0x0F, 0x00, 0x08, 0x00]
+        );
     }
 
     #[test]
