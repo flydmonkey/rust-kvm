@@ -118,7 +118,7 @@
 
     function eject(name) {
         const label = UsbMedia.SLOT_LABELS[name];
-        call(`弹出${label}`, "POST", `/api/usb/${name}/eject`, null, `已弹出${label}`);
+        call(`弹出${label}`, "POST", `/api/usb/${name}/eject`, {}, `已弹出${label}`);
     }
 
     function removeImage(name) {

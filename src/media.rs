@@ -16,8 +16,8 @@ pub fn validate_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() || name.len() > 200 {
         return Err("文件名为空或太长");
     }
-    if name.starts_with('.') || name.contains(['/', '\\', '\0']) {
-        return Err("文件名只能是一层普通名字，不能带路径，也不能以 . 开头");
+    if name.starts_with('.') || name.contains(['/', '\\']) || name.chars().any(char::is_control) {
+        return Err("文件名只能是一层普通名字，不能带路径、控制字符，也不能以 . 开头");
     }
     let lower = name.to_ascii_lowercase();
     if !(lower.ends_with(".iso") || lower.ends_with(".img")) {
@@ -43,10 +43,6 @@ pub struct ImageDir {
 impl ImageDir {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     pub fn path(&self, name: &str) -> Result<PathBuf, &'static str> {
@@ -101,7 +97,7 @@ mod tests {
 
     #[test]
     fn 不合法的文件名() {
-        for name in ["", "../x.iso", "a/b.iso", "a\\b.iso", ".hidden.iso", "x.exe", "x.iso.part"] {
+        for name in ["", "../x.iso", "a/b.iso", "a\\b.iso", ".hidden.iso", "x.exe", "x.iso.part", "a\nb.iso", "a\tb.iso", "a\u{7f}b.iso", "a\0b.iso", "a\u{85}b.iso"] {
             assert!(validate_name(name).is_err(), "{name}");
         }
     }

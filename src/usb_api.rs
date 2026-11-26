@@ -9,7 +9,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures_util::StreamExt;
@@ -102,6 +102,12 @@ impl UsbService {
 }
 
 async fn overview(State(service): State<Arc<UsbService>>) -> Json<Overview> {
+    // 不可用的板子上镜像目录不存在，也不该去读
+    let images = if service.gadget.is_some() {
+        service.images.list().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let slots = service.gadget.as_ref().map(|gadget| Slots {
         cdrom: service.view(gadget.slot(Slot::Cdrom)),
         disk: service.view(gadget.slot(Slot::Disk)),
@@ -110,8 +116,7 @@ async fn overview(State(service): State<Arc<UsbService>>) -> Json<Overview> {
         available: service.gadget.is_some(),
         reason: service.reason.clone(),
         slots,
-        // 目录没建（不可用的板子上就不建）时就是空列表
-        images: service.images.list().unwrap_or_default(),
+        images,
     })
 }
 
@@ -153,7 +158,26 @@ async fn mount(
     }
 }
 
-async fn eject(State(service): State<Arc<UsbService>>, Path(slot): Path<Slot>) -> Response {
+/// 弹盘不需要请求体，但要求带 JSON 头：跨站的表单只能发 form 或 text/plain，
+/// 带上 `application/json` 就得先过 CORS 预检，这样别的网页没法悄悄弹掉盘。
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let essence = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            essence == "application/json" || essence.ends_with("+json")
+        })
+}
+
+async fn eject(
+    State(service): State<Arc<UsbService>>,
+    Path(slot): Path<Slot>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_json(&headers) {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "请求要带 Content-Type: application/json").into_response();
+    }
     let Some(gadget) = service.gadget.clone() else {
         return service.unavailable();
     };
@@ -201,13 +225,14 @@ async fn upload(
             return (StatusCode::BAD_REQUEST, message).into_response();
         }
     };
-    if service.is_mounted(&target) {
-        return (StatusCode::CONFLICT, "这个镜像正挂着，先弹出再覆盖").into_response();
-    }
     if !service.uploading.lock().expect("上传表锁").insert(name.clone()) {
         return (StatusCode::CONFLICT, "同名文件正在上传").into_response();
     }
     let mut guard = UploadGuard { service: service.clone(), name: name.clone(), part: part.clone(), done: false };
+    // 先占名字再查挂载：反过来的话，查完到占上之间挂盘会放进来，覆盖一个正挂着的镜像
+    if service.is_mounted(&target) {
+        return (StatusCode::CONFLICT, "这个镜像正挂着，先弹出再覆盖").into_response();
+    }
     match write_upload(body, &part, &target).await {
         Ok(size) => {
             guard.done = true;
@@ -333,8 +358,79 @@ mod tests {
     async fn 弹出后槽是空的() {
         let s = setup();
         mount(State(s.service.clone()), Path(Slot::Disk), request("drivers.img", true)).await;
-        let body = json(eject(State(s.service), Path(Slot::Disk)).await).await;
+        let body = json(eject(State(s.service), Path(Slot::Disk), json_headers()).await).await;
         assert_eq!(body["slots"]["disk"]["image"], serde_json::Value::Null);
+    }
+
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn 弹出要求_json_头否则_415() {
+        let s = setup();
+        mount(State(s.service.clone()), Path(Slot::Disk), request("drivers.img", true)).await;
+        for content_type in [None, Some("text/plain"), Some("application/x-www-form-urlencoded")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = content_type {
+                headers.insert(header::CONTENT_TYPE, value.parse().unwrap());
+            }
+            let response = eject(State(s.service.clone()), Path(Slot::Disk), headers).await;
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{content_type:?}");
+        }
+        let body = json(overview(State(s.service.clone())).await.into_response()).await;
+        assert_eq!(body["slots"]["disk"]["image"], "drivers.img");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "Application/JSON; charset=utf-8".parse().unwrap());
+        let response = eject(State(s.service), Path(Slot::Disk), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn 正在上传的镜像不能挂() {
+        let s = setup();
+        s.service.uploading.lock().unwrap().insert("win.iso".into());
+        let response = mount(State(s.service), Path(Slot::Cdrom), request("win.iso", false)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn 上传被挂载拒绝后不留_正在上传_的占位() {
+        let s = setup();
+        mount(State(s.service.clone()), Path(Slot::Disk), request("drivers.img", false)).await;
+        let response = upload(State(s.service.clone()), Path("drivers.img".into()), Body::from("x")).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(s.service.uploading.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(s.images.join("drivers.img")).unwrap(), "img");
+        let response = upload(State(s.service.clone()), Path("other.img".into()), Body::from("y")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn 不支持的平台上概览是固定的形状() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("stray.iso"), "x").unwrap();
+        let service = UsbService::new(&Availability::Unsupported, ImageDir::new(temp.path().to_path_buf()));
+        let body = json(overview(State(service)).await.into_response()).await;
+        assert_eq!(
+            body,
+            serde_json::json!({"available": false, "reason": null, "slots": null, "images": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn 不可用时镜像列表也是空的() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("stray.iso"), "x").unwrap();
+        let service = UsbService::new(
+            &Availability::Unavailable("没有 USB 设备控制器".into()),
+            ImageDir::new(temp.path().to_path_buf()),
+        );
+        let body = json(overview(State(service)).await.into_response()).await;
+        assert_eq!(body["images"], serde_json::json!([]));
     }
 
     #[tokio::test]
