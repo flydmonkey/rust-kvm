@@ -13,12 +13,14 @@ mod devices;
 mod gadget_setup;
 mod h264;
 mod hid_emulator;
+mod media;
 mod nv12;
 mod serial_bridge;
 #[cfg(windows)]
 mod service;
 #[cfg(target_os = "linux")]
 mod systemd;
+mod usb_api;
 mod usb_gadget;
 mod video;
 
@@ -224,6 +226,18 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         Availability::Unsupported => None,
     };
 
+    // 只在可用时建目录：x86 上不该凭空多出一个 images/
+    let image_root = root.join(media::DIR_NAME);
+    if gadget.is_some()
+        && let Err(error) = std::fs::create_dir_all(&image_root)
+    {
+        warn!("建镜像目录 {} 失败：{error}", image_root.display());
+    }
+    // 规范化之后再交出去：写进 configfs 的必须是绝对路径，软链接也要解开，
+    // 否则槽里读回来的路径和这里拼出来的对不上，概览里就显示成全路径
+    let image_root = image_root.canonicalize().unwrap_or(image_root);
+    let usb_service = usb_api::UsbService::new(&usb, media::ImageDir::new(image_root));
+
     let state = AppState {
         hub: VideoHub::new(settings.video),
         audio: AudioHub::new(settings.audio),
@@ -247,6 +261,7 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         .route("/api/atx/press", post(atx_press))
         .route("/api/atx/release", post(atx_release))
         .route("/cert.crt", get(download_cert))
+        .merge(usb_api::router(usb_service))
         .fallback_service(ServeDir::new(root.join("web")))
         .layer(axum::middleware::map_response(no_cache))
         .with_state(state);

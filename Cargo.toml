@@ -24,7 +24,7 @@ serialport = "4.10.1"
 # 解 MJPEG 给编码器喂 NV12。纯 Rust，不引外部 DLL；直出 YCbCr 可以省掉色彩矩阵。
 zune-core = "0.5.3"
 zune-jpeg = "0.5.15"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
