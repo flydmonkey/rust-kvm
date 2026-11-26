@@ -64,7 +64,9 @@ pub fn install() -> Result<()> {
         .filter(|group| group_exists(group))
         .collect();
 
-    std::fs::write(UNIT_PATH, unit_file(installed, &root, &user, &groups))
+    // 只在 ARM 上加：x86 的板子没有 USB 设备控制器，多一步只会在日志里多一行「跳过」
+    let gadget = cfg!(any(target_arch = "aarch64", target_arch = "arm"));
+    std::fs::write(UNIT_PATH, unit_file(installed, &root, &user, &groups, gadget))
         .with_context(|| format!("写 {UNIT_PATH} 失败"))?;
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", SERVICE_NAME])?;
@@ -73,6 +75,9 @@ pub fn install() -> Result<()> {
     println!("  程序：{INSTALLED_EXE}（从 {} 拷过去）", exe.display());
     println!("  用户：{user}，附加组：{}", groups.join(" "));
     println!("  资源目录：{}", root.display());
+    if gadget {
+        println!("  本机 USB 口：每次启动前以 root 建 gadget（虚拟光驱、U 盘、键鼠）");
+    }
     println!();
     println!("接下来：sudo rust-kvm start（服务已经在跑的话 stop 再 start 才换成新程序）");
     Ok(())
@@ -143,7 +148,12 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-fn unit_file(exe: &Path, root: &Path, user: &str, groups: &[&str]) -> String {
+fn unit_file(exe: &Path, root: &Path, user: &str, groups: &[&str], gadget: bool) -> String {
+    let gadget_setup = if gadget {
+        format!("ExecStartPre=-+\"{}\" usb-gadget-setup {user}\n", exe.display())
+    } else {
+        String::new()
+    };
     format!(
         "\
 [Unit]
@@ -152,7 +162,7 @@ After=network-online.target sound.target
 Wants=network-online.target
 
 [Service]
-ExecStart=\"{exe}\"
+{gadget_setup}ExecStart=\"{exe}\"
 WorkingDirectory={root}
 User={user}
 SupplementaryGroups={groups}
@@ -241,10 +251,19 @@ mod tests {
             Path::new("/opt/my kvm"),
             "alice",
             &["video", "audio"],
+            false,
         );
         assert!(unit.contains("ExecStart=\"/opt/my kvm/rust-kvm\"\n"));
         assert!(unit.contains("User=alice\n"));
         assert!(unit.contains("SupplementaryGroups=video audio\n"));
         assert!(unit.contains(&format!("LimitRTPRIO={}\n", crate::audio::REALTIME_PRIORITY)));
+        assert!(!unit.contains("usb-gadget-setup"));
+    }
+
+    /// `-` 让 gadget 建不起来时服务照样启动，`+` 让这一步以 root 跑。
+    #[test]
+    fn arm_上先以_root_建_gadget() {
+        let unit = unit_file(Path::new("/usr/local/bin/rust-kvm"), Path::new("/srv/kvm"), "alice", &[], true);
+        assert!(unit.contains("ExecStartPre=-+\"/usr/local/bin/rust-kvm\" usb-gadget-setup alice\n"));
     }
 }

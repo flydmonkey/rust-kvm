@@ -9,6 +9,8 @@ mod camera;
 mod certs;
 mod config;
 mod devices;
+#[cfg(target_os = "linux")]
+mod gadget_setup;
 mod h264;
 mod hid_emulator;
 mod nv12;
@@ -94,6 +96,8 @@ const USAGE: &str = "\
   sudo rust-kvm start       启动服务
   sudo rust-kvm stop        停止服务
   rust-kvm status           看服务状态和日志位置
+  rust-kvm usb-gadget-setup <用户>
+                            建本机 USB 口的 gadget（ARM 板上 systemd 启动前自动跑，不用手动）
 
 服务以执行 install 的那个用户身份跑，附加 video / audio / dialout 组并允许实时
 优先级——前台跑时设备权限来自登录会话，服务里没有那一层。";
@@ -141,6 +145,7 @@ fn run_command(command: &str) -> Result<()> {
         "start" => systemd::start(),
         "stop" => systemd::stop(),
         "status" => systemd::status(),
+        "usb-gadget-setup" => gadget_setup::run(std::env::args().nth(2).as_deref()),
         other => {
             eprintln!("未知命令：{other}\n\n{USAGE}");
             std::process::exit(2);
