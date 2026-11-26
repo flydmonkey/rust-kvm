@@ -293,6 +293,8 @@ internal data class SettingsForm(
     val serialPort: String,
     val baudRate: String,
     val mouseMode: String,
+    /** 手机上不给改，但保存时要原样带回去，否则在手机上存一次就把网页上开的常驻采集关了。 */
+    val keepCapturing: Boolean = false,
 ) {
     fun toConfig(): KvmConfig = KvmConfig(
         video = VideoSettings(
@@ -306,6 +308,7 @@ internal data class SettingsForm(
             } else {
                 bitrateKbps.toIntOrNull()?.takeIf { it > 0 } ?: KvmConfig.DEFAULT.video.bitrateKbps
             },
+            keepCapturing = keepCapturing,
         ),
         audio = AudioSettings(
             device = audioDevice,
@@ -333,6 +336,7 @@ internal data class SettingsForm(
             serialPort = config.serial.port,
             baudRate = config.serial.baudRate.toString(),
             mouseMode = config.serial.mouseMode,
+            keepCapturing = config.video.keepCapturing,
         )
     }
 }

@@ -1,8 +1,9 @@
 //! 采集卡到 WebSocket 之间的那一段：一个独占设备的采集线程，把采集卡直出的
 //! JPEG 原样广播给所有观看者。服务端一次都不解码。
 //!
-//! 设备是独占的，所以采集按需启停：有人看才开，没人看了再多采一会儿就关掉，
-//! 好让别的程序（或者本地的 chrome-kvm）能用这张卡。
+//! 设备是独占的，所以默认按需启停：有人看才开，没人看了再多采一会儿就关掉，
+//! 好让别的程序（或者本地的 chrome-kvm）能用这张卡。配置里打开 `keep_capturing`
+//! 就改成服务一起来就采、一直不停。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -182,7 +183,15 @@ impl VideoHub {
         });
         tokio::spawn(supervise(hub.clone()));
         tokio::spawn(supervise_encoder(hub.clone()));
+        // 常驻采集不等第一个观看者。Notify 会留着这个许可，supervise 还没跑到
+        // `notified()` 也丢不了。
+        hub.wake.notify_one();
         hub
+    }
+
+    /// 采集该不该开着：有人看，或者配置要求常驻。
+    fn capture_wanted(&self) -> bool {
+        self.frames.receiver_count() > 0 || self.config.lock().expect("config 锁").keep_capturing
     }
 
     /// 配置真的变了才动采集：设置页保存时不关心哪几项改了，会把整份配置推过来，
@@ -193,7 +202,18 @@ impl VideoHub {
             if *current == config {
                 return;
             }
+            // 只动了常驻开关就不必重开：采集循环每帧都现读这个开关。打开时没人在采
+            // 的话要叫醒 supervise，关掉时由循环自己走 IDLE_GRACE 退出。
+            let same_stream = VideoSettings {
+                keep_capturing: current.keep_capturing,
+                ..config.clone()
+            } == *current;
             *current = config;
+            if same_stream {
+                drop(current);
+                self.wake.notify_one();
+                return;
+            }
         }
         info!("视频配置已更新，重开采集");
         // 编码参数（编码方式、码率、分辨率）也可能变了。把 codec 状态重置成「配置
@@ -333,7 +353,7 @@ impl VideoHub {
 async fn supervise(hub: Arc<VideoHub>) {
     loop {
         hub.wake.notified().await;
-        if hub.frames.receiver_count() == 0 || hub.capturing.swap(true, Ordering::SeqCst) {
+        if !hub.capture_wanted() || hub.capturing.swap(true, Ordering::SeqCst) {
             continue;
         }
 
@@ -359,7 +379,7 @@ async fn supervise(hub: Arc<VideoHub>) {
         }
 
         // 出错时别立刻重试，否则设备拔掉之后会疯转
-        if hub.frames.receiver_count() > 0 {
+        if hub.capture_wanted() {
             tokio::time::sleep(Duration::from_secs(1)).await;
             hub.wake.notify_one();
         }
@@ -724,7 +744,7 @@ fn capture_loop(hub: &VideoHub) -> Result<StopReason> {
             break Ok(StopReason::Reconfigured);
         }
 
-        if hub.frames.receiver_count() == 0 {
+        if !hub.capture_wanted() {
             let since = idle_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= IDLE_GRACE {
                 break Ok(StopReason::Idle);

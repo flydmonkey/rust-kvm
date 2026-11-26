@@ -40,6 +40,9 @@ pub struct VideoSettings {
     pub codec: String,
     /// 只对 h264 有意义。固定码率，不做自适应（理由见低带宽模式的设计文档）。
     pub bitrate_kbps: u32,
+    /// 没人看也一直采。默认关：采集卡是独占的，按需启停才能让本地别的程序用它；
+    /// 打开后换来的是打开控制页不用等采集卡起来（MS2109 要一秒多）。
+    pub keep_capturing: bool,
 }
 
 impl Default for VideoSettings {
@@ -52,6 +55,7 @@ impl Default for VideoSettings {
             // 默认 mjpeg：日常是局域网，低带宽是出门时才开的
             codec: "mjpeg".to_string(),
             bitrate_kbps: 4000,
+            keep_capturing: false,
         }
     }
 }

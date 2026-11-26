@@ -30,6 +30,7 @@
     const videoFps = el("video-fps");
     const videoCodec = el("video-codec");
     const videoBitrate = el("video-bitrate");
+    const videoKeep = el("video-keep");
     const audioDevice = el("audio-device");
     const audioEnabled = el("audio-enabled");
     const audioNarrowband = el("audio-narrowband");
@@ -167,6 +168,7 @@
         selectOrKeep(videoCodec, config.video.codec);
         selectOrKeep(videoBitrate, String(config.video.bitrateKbps));
         renderBitrateState();
+        videoKeep.checked = config.video.keepCapturing;
 
         selectDevice(audioDevice, config.audio.device);
         audioEnabled.checked = config.audio.enabled;
@@ -198,7 +200,8 @@
                 height: height,
                 fps: Number(videoFps.value),
                 codec: videoCodec.value,
-                bitrateKbps: Number(videoBitrate.value)
+                bitrateKbps: Number(videoBitrate.value),
+                keepCapturing: videoKeep.checked
             },
             audio: {
                 device: audioDevice.value,
@@ -846,7 +849,9 @@
                 rememberCapture(device);
                 renderCaptureLabels(false);
             } else {
-                setCaptureHint("采集卡正在被控制页使用，这一档的帧率要等没人看再测。正在采集的那一档会用画面状态里的帧率来标。");
+                setCaptureHint(config && config.video.keepCapturing
+                    ? "开着常驻采集，采集卡一直被占着，别的档测不了帧率。正在采集的那一档会用画面状态里的帧率来标。"
+                    : "采集卡正在被控制页使用，这一档的帧率要等没人看再测。正在采集的那一档会用画面状态里的帧率来标。");
             }
             return;
         }

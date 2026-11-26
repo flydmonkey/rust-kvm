@@ -75,6 +75,10 @@
             gap: 10px;
         }
 
+        .pair.triple {
+            grid-template-columns: 1fr auto auto;
+        }
+
         .checkline {
             display: flex;
             gap: 8px;
@@ -239,13 +243,13 @@
         </div>
         <div class="field">
             <label for="video-size">分辨率</label>
-            <div class="pair">
+            <div class="pair triple">
                 <select id="video-size"></select>
                 <select id="video-fps"></select>
+                <button id="probe-capture" type="button">重新检测</button>
             </div>
         </div>
         <p class="hint" id="capture-hint" hidden></p>
-        <button id="probe-capture" type="button">重新检测采集卡</button>
         <div class="field">
             <label for="video-codec">编码</label>
             <div class="pair">
@@ -259,6 +263,13 @@
             是动起来时的上限。</p>
         <p class="hint">切换编码不用刷新控制页，也不会断开连接。浏览器不支持 H.264 解码
             或宿主机没有编码器时会自动退回 MJPEG，原因显示在控制页的连接信息里。</p>
+        <div class="checkline">
+            <input id="video-keep" type="checkbox">
+            <label for="video-keep">没人看时也保持采集</label>
+        </div>
+        <p class="hint">默认关：最后一个人离开控制页 3 秒后关掉采集卡，让宿主机上别的程序能用它。
+            打开后服务一启动就采、一直不停，打开控制页不用等采集卡起来；代价是采集卡一直被占着。
+            H.264 编码不受影响，仍然只在有人看时才跑，没人看时只是收帧，几乎不占 CPU。</p>
         <p class="live" id="video-live">读取中…</p>
     </section>
 

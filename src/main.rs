@@ -556,7 +556,7 @@ async fn video_measure(
         Ok(Ok(fps)) => Json(serde_json::json!({ "fps": fps })).into_response(),
         Ok(Err(video::MeasureError::Busy)) => (
             StatusCode::CONFLICT,
-            "采集卡正在使用。关掉控制页，等没人看之后再测这一档的帧率",
+            "采集卡正在使用。关掉控制页（开了常驻采集的话先关掉它），等采集停下再测这一档的帧率",
         )
             .into_response(),
         Ok(Err(video::MeasureError::Failed(error))) => {

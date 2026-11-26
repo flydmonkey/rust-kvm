@@ -23,6 +23,7 @@ data class VideoSettings(
     val fps: Int = 30,
     val codec: String = "mjpeg",
     val bitrateKbps: Int = 4000,
+    val keepCapturing: Boolean = false,
 )
 
 @Serializable
