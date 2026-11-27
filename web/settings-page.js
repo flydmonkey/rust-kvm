@@ -236,7 +236,13 @@
         saveStatus.className = "";
         try {
             const [devices, current] = await Promise.all([
-                fetch("/api/devices", {cache: "no-store"}).then((r) => r.json()),
+                fetch("/api/devices", {cache: "no-store"}).then(async (r) => {
+                    // 枚举超时回的是一句人话，不是 JSON
+                    if (!r.ok) {
+                        throw new Error(await r.text());
+                    }
+                    return r.json();
+                }),
                 fetch("/api/config", {cache: "no-store"}).then((r) => r.json())
             ]);
             config = current;

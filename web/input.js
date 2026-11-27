@@ -178,6 +178,9 @@
         let ports = [];
         try {
             const response = await fetch("/api/serial/ports", {cache: "no-store"});
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
             ports = await response.json();
         } catch (e) {
             if (!quiet) {

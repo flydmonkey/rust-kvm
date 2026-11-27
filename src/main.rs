@@ -195,11 +195,16 @@ pub(crate) fn init_logging(file: Option<&std::path::Path>) -> Result<()> {
 
 /// 服务模式下 `main` 已经不是 async 了（SCM 要先握手再干活），运行时得自己建。
 pub(crate) fn block_on_server(handle: ServerHandle) -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("建 tokio 运行时失败")?
-        .block_on(run_server(handle))
+        .context("建 tokio 运行时失败")?;
+    let outcome = runtime.block_on(run_server(handle));
+    // 直接 drop 会无限期等所有 blocking 线程：卡在驱动里的枚举、堵在 frame_raw 上
+    // 的采集都回不来，进程就停不下，systemd 等满超时再 SIGKILL。该收的尾（全释放
+    // 包）在 run_server 返回前已经做完了。
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    outcome
 }
 
 async fn run_server(handle: ServerHandle) -> Result<()> {
@@ -558,8 +563,50 @@ struct DeviceQuery {
 }
 
 /// 能力表。Linux 上只枚举，不打断正在进行的采集。
-async fn video_capabilities(Query(query): Query<DeviceQuery>) -> Json<video::CaptureCapabilities> {
-    Json(video::list_capabilities(&query.device))
+async fn video_capabilities(Query(query): Query<DeviceQuery>) -> Response {
+    match enumerate(move || video::list_capabilities(&query.device)).await {
+        Ok(capabilities) => Json(capabilities).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// 枚举设备要一路问进驱动。USB 正在出错时（采集卡报 -71、ALSA 报 Host is down）
+/// 这一问可能一直不回来，压在 tokio 的 worker 上的话卡一次少一个线程，设置页多
+/// 进几次整个服务就不再响应——页面、画面、键鼠一起没了，而 systemd 看它还活着。
+const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 放到 blocking 线程上跑，等不到就先回话。卡住的那个线程留在原地，回不来也只是
+/// 它自己。
+async fn enumerate<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    enumerate_within(ENUMERATE_TIMEOUT, work).await
+}
+
+async fn enumerate_within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    use axum::http::StatusCode;
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("枚举设备的线程异常退出: {error}"),
+        )
+            .into_response()),
+        Err(_) => {
+            warn!("枚举设备 {:?} 没有返回", limit);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "枚举设备 {} 秒没有返回，多半是某个 USB 设备正在出错。重新插拔或者换个口再试",
+                    limit.as_secs()
+                ),
+            )
+                .into_response())
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -780,18 +827,24 @@ async fn no_cache(mut response: Response) -> Response {
 }
 
 /// 远程浏览器没有宿主机的 Web Serial 权限，选口只能靠服务端枚举。
-async fn serial_ports(State(state): State<AppState>) -> Json<Vec<PortInfo>> {
-    let mut ports = serial_bridge::list_ports();
+async fn serial_ports(State(state): State<AppState>) -> Response {
+    let mut ports: Vec<PortInfo> = match enumerate(serial_bridge::list_ports).await {
+        Ok(ports) => ports,
+        Err(response) => return response,
+    };
     state.serial.add_gadget_port(&mut ports);
-    Json(ports)
+    Json(ports).into_response()
 }
 
 /// 每次请求都重新枚举，不缓存：设备是会被插拔的，而设置页上那个列表过期了
 /// 就直接导致选不到设备。
-async fn list_devices(State(state): State<AppState>) -> Json<Devices> {
-    let mut devices = devices::enumerate();
+async fn list_devices(State(state): State<AppState>) -> Response {
+    let mut devices: Devices = match enumerate(devices::enumerate).await {
+        Ok(devices) => devices,
+        Err(response) => return response,
+    };
     state.serial.add_gadget_port(&mut devices.serial.items);
-    Json(devices)
+    Json(devices).into_response()
 }
 
 async fn get_config(State(state): State<AppState>) -> Json<Config> {
@@ -907,4 +960,31 @@ pub(crate) fn asset_root() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use axum::http::StatusCode;
+
+    use super::enumerate_within;
+
+    #[tokio::test]
+    async fn 枚举卡住时按时回_503_而不是一直等() {
+        let started = Instant::now();
+        let outcome = enumerate_within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(2));
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let response = outcome.expect_err("应该超时");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn 枚举正常返回时原样交出结果() {
+        let ports = enumerate_within(Duration::from_secs(1), || vec!["/dev/ttyACM0"]).await;
+        assert_eq!(ports.ok(), Some(vec!["/dev/ttyACM0"]));
+    }
 }
