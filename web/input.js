@@ -620,7 +620,8 @@
             }
             wheelPixels -= notches * WHEEL_PIXELS_PER_NOTCH;
             // 浏览器 deltaY 向下为正，协议齿数向上为正
-            ch.mouseScroll(-notches);
+            const reverse = settings && settings.serial.scrollDirection === "reverse";
+            ch.mouseScroll(reverse ? notches : -notches);
         }, {passive: true});
 
         // 每个事件直接下发，中间不再加一层合并。限流由 ch9329.js 的发送队列

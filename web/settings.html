@@ -311,8 +311,16 @@
                 <option value="relative">相对（需要 Pointer Lock，适合游戏）</option>
             </select>
         </div>
+        <div class="field">
+            <label for="scroll-direction">滚轮方向</label>
+            <select id="scroll-direction">
+                <option value="normal">标准（Windows、Linux）</option>
+                <option value="reverse">反向（被控机是开了自然滚动的 Mac）</option>
+            </select>
+        </div>
         <p class="hint">串口不热切换，下次在控制页点「连接键鼠」时生效。
-            相对模式需要芯片工作在模式 2，否则某些被控端点不动。</p>
+            相对模式需要芯片工作在模式 2，否则某些被控端点不动。
+            滚轮方向看的是被控机：被控机滚反了就换一下，回到控制页就生效。</p>
     </section>
 
     <section id="chip-section">

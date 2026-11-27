@@ -38,6 +38,8 @@ data class SerialSettings(
     val port: String = "",
     val baudRate: Int = 115200,
     val mouseMode: String = "absolute",
+    /** `normal` 或 `reverse`，看的是被控机，见 Rust 端 `SerialSettings` */
+    val scrollDirection: String = "normal",
 )
 
 @Serializable

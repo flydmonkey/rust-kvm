@@ -188,7 +188,10 @@ fun ControlScreen(
             override fun relative(dx: Int, dy: Int, buttons: Int) =
                 send { it.mouseMoveRelative(dx, dy, buttons) }
 
-            override fun scroll(notches: Int) = send { it.mouseScroll(notches) }
+            override fun scroll(notches: Int) {
+                val reverse = config?.serial?.scrollDirection == "reverse"
+                send { it.mouseScroll(if (reverse) -notches else notches) }
+            }
 
             private fun send(action: (SerialControl<KvmSession>) -> Unit) {
                 val control = serialControl ?: return

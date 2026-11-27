@@ -37,6 +37,7 @@
     const serialPort = el("serial-port");
     const serialBaud = el("serial-baud");
     const mouseMode = el("mouse-mode");
+    const scrollDirection = el("scroll-direction");
     const workingMode = el("working-mode");
     const atxPort = el("atx-port");
     const atxChannel = el("atx-channel");
@@ -187,6 +188,7 @@
         renderChipSection();
         selectOrKeep(serialBaud, String(config.serial.baudRate));
         mouseMode.value = config.serial.mouseMode;
+        scrollDirection.value = config.serial.scrollDirection === "reverse" ? "reverse" : "normal";
 
         const atx = Atx.normalize(config.atx);
         atxPort.value = "";
@@ -221,7 +223,8 @@
             serial: {
                 port: serialPort.value,
                 baudRate: Number(serialBaud.value),
-                mouseMode: mouseMode.value
+                mouseMode: mouseMode.value,
+                scrollDirection: scrollDirection.value
             },
             atx: Atx.normalize({
                 port: atxPort.value,

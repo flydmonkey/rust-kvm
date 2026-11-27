@@ -17,8 +17,14 @@ var Profiles = (function () {
         "video.fps",
         "audio.device",
         "serial.port",
-        "serial.mouseMode"
+        "serial.mouseMode",
+        "serial.scrollDirection"
     ];
+    // 后来才加的字段。老配置里没有，切过去时用这个值而不是沿用当前的：
+    // 有这个选项之前存的配置，滚轮本来就是按标准方向发的
+    var LATER_DEFAULTS = {
+        "serial.scrollDirection": "normal"
+    };
     // 继电器整个对象一起存。配置里没有就清空、不沿用当前值：沿用上一台的继电器，
     // 按下去断电的就是另一台机器
     var ATX_FIELD = "atx";
@@ -176,6 +182,9 @@ var Profiles = (function () {
         var merged = JSON.parse(JSON.stringify(current || {}));
         FIELDS.forEach(function (path) {
             var value = read(saved, path);
+            if (value === undefined) {
+                value = LATER_DEFAULTS[path];
+            }
             if (value !== undefined) {
                 write(merged, path, value);
             }
@@ -204,6 +213,9 @@ var Profiles = (function () {
             parts.push(width + "×" + height);
         }
         parts.push(read(settings, "serial.mouseMode") === "relative" ? "相对" : "绝对");
+        if (read(settings, "serial.scrollDirection") === "reverse") {
+            parts.push("滚轮反向");
+        }
         var port = read(settings, "serial.port");
         if (port) {
             parts.push(port);

@@ -157,6 +157,12 @@ fun SettingsScreen(
                     choices = listOf("absolute" to "绝对", "relative" to "相对"),
                     onValueChange = { form = current.copy(mouseMode = it) },
                 )
+                ChoiceField(
+                    label = "滚轮方向（被控机是开了自然滚动的 Mac 选反向）",
+                    value = current.scrollDirection,
+                    choices = listOf("normal" to "标准", "reverse" to "反向"),
+                    onValueChange = { form = current.copy(scrollDirection = it) },
+                )
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -293,6 +299,7 @@ internal data class SettingsForm(
     val serialPort: String,
     val baudRate: String,
     val mouseMode: String,
+    val scrollDirection: String = "normal",
     /** 手机上不给改，但保存时要原样带回去，否则在手机上存一次就把网页上开的常驻采集关了。 */
     val keepCapturing: Boolean = false,
 ) {
@@ -319,6 +326,7 @@ internal data class SettingsForm(
             port = serialPort,
             baudRate = baudRate.positiveInt("波特率"),
             mouseMode = mouseMode,
+            scrollDirection = scrollDirection,
         ),
     )
 
@@ -336,6 +344,7 @@ internal data class SettingsForm(
             serialPort = config.serial.port,
             baudRate = config.serial.baudRate.toString(),
             mouseMode = config.serial.mouseMode,
+            scrollDirection = config.serial.scrollDirection,
             keepCapturing = config.video.keepCapturing,
         )
     }
