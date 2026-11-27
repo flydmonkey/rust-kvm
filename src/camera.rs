@@ -40,6 +40,31 @@ fn filter(devices: Vec<CameraInfo>) -> Vec<CameraInfo> {
     devices
 }
 
+/// 打开设备前先把帧间隔摆成整数帧率。
+///
+/// nokhwa 的 V4L2 后端开设备时先读**当前**帧间隔，帧率不是整数就直接报错，请求的
+/// 格式根本来不及设下去。UGREEN 25173 的 240 档是 `20833/5000000`（240.004），设置页
+/// 按这档实测过一次，设备就停在那儿，之后谁来开都失败，直到拔插。
+///
+/// 失败不报：设不上的话 nokhwa 那一步会给出更具体的错误。
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub fn settle_frame_interval(index: &nokhwa::utils::CameraIndex, fps: u32) {
+    use v4l::video::Capture;
+    use v4l::video::capture::Parameters;
+
+    let Ok(index) = index.as_index() else {
+        return;
+    };
+    if let Ok(device) = v4l::Device::new(index as usize) {
+        let _ = device.set_params(&Parameters::with_fps(fps.max(1)));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn settle_frame_interval(_index: &nokhwa::utils::CameraIndex, _fps: u32) {}
+
 /// 一档 MJPEG。`rates` 是能力表里写的帧率，从高到低，**不能当实测**——
 /// MS2109 的 1080p 也写着 60，真画面只有 30。
 ///
