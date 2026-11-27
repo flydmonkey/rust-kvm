@@ -805,11 +805,31 @@ fn tone_loop(hub: Arc<AudioHub>) -> Result<StopReason> {
     }
 }
 
+/// 这个设备能不能放心去打开。
+///
+/// Linux 上只认绑在具体声卡上的 PCM（ID 里带 `CARD=`）。`default`、`pipewire`、
+/// `pulse` 这些要经过用户桌面会话里的声音服务，而这里是系统服务，没有那个会话：
+/// 好的时候报一句 Host is down，坏的时候打开到一半卡死在插件里再也不返回。
+/// cpal 用一把全局锁串起所有打开操作，一次卡死就把之后的采音和列设备全堵住，
+/// 只能重启服务。
+#[cfg(target_os = "linux")]
+pub fn opens_directly(device: &Device) -> bool {
+    device
+        .id()
+        .is_ok_and(|id| id.to_string().contains("CARD="))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn opens_directly(_device: &Device) -> bool {
+    true
+}
+
 fn pick_device(hint: &str) -> Result<Device> {
     let host = cpal::default_host();
     let devices: Vec<Device> = host
         .input_devices()
         .context("枚举音频输入设备失败")?
+        .filter(opens_directly)
         .collect();
 
     if devices.is_empty() {
@@ -829,6 +849,8 @@ fn pick_device(hint: &str) -> Result<Device> {
         }
     }
 
+    // Linux 上的默认设备就是走声音服务的那个，见 opens_directly
+    #[cfg(not(target_os = "linux"))]
     if let Some(device) = host.default_input_device() {
         warn!("没找到名字含「{hint}」的音频设备，退回默认输入设备 {device}");
         return Ok(device);
