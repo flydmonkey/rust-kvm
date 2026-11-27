@@ -438,10 +438,29 @@ async fn send_codec_header(
     if let Some(reason) = &state.fallback_reason {
         header["fallbackReason"] = serde_json::json!(reason);
     }
-    sender
-        .send(Message::Text(header.to_string().into()))
-        .await
-        .map_err(|_| ())
+    send_within(sender, Message::Text(header.to_string().into())).await
+}
+
+/// 一条消息这么久还发不出去，就当对面已经不读了。
+///
+/// TCP 不会替我们发现这种连接：浏览器把页面冻进往返缓存、标签页被挂起时，连接
+/// 好好的，只是接收窗口归零，send 就永远停在那儿。推流任务跟着停住，订阅却还在，
+/// 于是采集卡一直「有人在看」，设置页里观看者也多出一个。实测一条这样的连接积了
+/// 3 MB 没人读。10 秒对慢网也够：最大的 1080p JPEG 七百来 KB，1 Mbps 也只要六秒。
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn send_within(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+) -> Result<(), ()> {
+    match tokio::time::timeout(SEND_TIMEOUT, sender.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            info!("客户端 {} 秒没有读数据，断开", SEND_TIMEOUT.as_secs());
+            Err(())
+        }
+    }
 }
 
 /// 配置变了就返回，让外层重发头。
@@ -480,7 +499,7 @@ async fn pump_mjpeg(
             // 静止时这条是唯一的出口，所以它也兼任「连接还在」的心跳
             _ = tokio::time::sleep_until(next_notice) => {
                 let notice = serde_json::json!({"op": "idle", "skipped": skipped_duplicates});
-                if sender.send(Message::Text(notice.to_string().into())).await.is_err() {
+                if send_within(sender, Message::Text(notice.to_string().into())).await.is_err() {
                     return Err(());
                 }
                 next_notice = tokio::time::Instant::now() + IDLE_NOTICE;
@@ -497,7 +516,7 @@ async fn pump_mjpeg(
                     hub.record_sent(frame.len());
                     // send 会在客户端慢的时候等着，这期间 broadcast 那头会积压
                     // 并触发下面的 Lagged，正好实现「慢客户端丢帧」。
-                    if sender.send(Message::Binary(frame)).await.is_err() {
+                    if send_within(sender, Message::Binary(frame)).await.is_err() {
                         return Err(());
                     }
                 }
@@ -533,7 +552,7 @@ async fn pump_h264(
                         waiting_for_keyframe = false;
                     }
                     hub.record_sent(packet.data.len());
-                    if sender.send(Message::Binary(packet.data)).await.is_err() {
+                    if send_within(sender, Message::Binary(packet.data)).await.is_err() {
                         return Err(());
                     }
                 }
@@ -689,7 +708,7 @@ async fn stream_audio(socket: WebSocket, hub: Arc<AudioHub>) {
             Err(message) => {
                 info!("音频开不起来: {message}");
                 let payload = serde_json::json!({"op": "error", "message": message});
-                let _ = sender.send(Message::Text(payload.to_string().into())).await;
+                let _ = send_within(&mut sender, Message::Text(payload.to_string().into())).await;
                 break;
             }
         };
@@ -701,8 +720,7 @@ async fn stream_audio(socket: WebSocket, hub: Arc<AudioHub>) {
                 "channels": format.channels,
                 "format": "s16le",
             });
-            if sender
-                .send(Message::Text(header.to_string().into()))
+            if send_within(&mut sender, Message::Text(header.to_string().into()))
                 .await
                 .is_err()
             {
@@ -744,7 +762,7 @@ async fn pump_audio(
             _ = format_rx.changed() => return PumpEnd::FormatChanged,
             chunk = chunks.recv() => match chunk {
                 Ok(chunk) => {
-                    if sender.send(Message::Binary(chunk)).await.is_err() {
+                    if send_within(sender, Message::Binary(chunk)).await.is_err() {
                         return PumpEnd::Done;
                     }
                 }

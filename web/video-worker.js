@@ -31,6 +31,8 @@ let decoderCodec = null;
 let seenKeyFrame = false;
 // 服务端说画面静止时，累计跳过了多少重复帧；收到新帧就清空
 let idleSkipped = null;
+// 页面进了往返缓存。这期间不连、不重连，见 viewer.js 的 pagehide
+let paused = false;
 
 let window_ = newWindow();
 
@@ -42,6 +44,21 @@ self.onmessage = (event) => {
     const message = event.data;
     if (message.type === "tap") {
         tapping = message.on;
+        return;
+    }
+    if (message.type === "pause") {
+        paused = true;
+        if (socket) {
+            socket.close();
+        }
+        return;
+    }
+    if (message.type === "resume") {
+        paused = false;
+        // 还在 CLOSING 的话不用管，它的 onclose 会照常排上重连
+        if (!socket || socket.readyState === WebSocket.CLOSED) {
+            connect();
+        }
         return;
     }
     // 文字识别要一张当前画面。不能等下一帧：MJPEG 画面静止时服务端一帧都不发。
@@ -69,6 +86,9 @@ self.onmessage = (event) => {
 };
 
 function connect() {
+    if (paused) {
+        return;
+    }
     socket = new WebSocket(socketUrl);
     socket.binaryType = "arraybuffer";
 

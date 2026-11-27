@@ -353,6 +353,18 @@
         render();
     }, STATS_POLL_MS);
 
+    // 离开页面就断，理由同 viewer.js 的 pagehide。teardown 是同步的，来得及。
+    // 不动 enabled：回来时照原来的开关状态重连
+    window.addEventListener("pagehide", () => {
+        clearTimeout(retryTimer);
+        teardown();
+    });
+    window.addEventListener("pageshow", (event) => {
+        if (event.persisted && enabled && !socket) {
+            connect();
+        }
+    });
+
     // 默认就连。出不出声由自动播放策略决定，用户不用再点一下开关。
     connect();
     render();
