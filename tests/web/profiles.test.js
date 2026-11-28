@@ -51,11 +51,28 @@ test("apply 合并进当前配置，编码、码率、窄带、波特率保持�
     assert.deepStrictEqual(result.settings, {
         video: {device: "Cam B", width: 1280, height: 720, fps: 25, codec: "h264", bitrateKbps: 4000},
         audio: {device: "Mic B", enabled: true, narrowband: false},
-        serial: {port: "COM7", baudRate: 115200, mouseMode: "relative"},
+        serial: {port: "COM7", baudRate: 115200, mouseMode: "relative", scrollDirection: "normal"},
         atx: null
     });
     assert.strictEqual(result.state.active, "办公室");
     assert.strictEqual(current.video.device, "USB Video", "不能改动传入的当前配置");
+});
+
+test("滚轮方向跟着配置走", () => {
+    const state = Profiles.saveAs(Profiles.normalize(null), "Mac", config({
+        serial: {port: "COM3", baudRate: 115200, mouseMode: "absolute", scrollDirection: "reverse"}
+    })).state;
+    assert.strictEqual(state.profiles[0].settings.serial.scrollDirection, "reverse");
+    const result = Profiles.apply(state, "Mac", config());
+    assert.strictEqual(result.settings.serial.scrollDirection, "reverse");
+    assert.strictEqual(Profiles.summary(state.profiles[0].settings), "1920×1080 · 绝对 · 滚轮反向 · COM3 · USB Video");
+});
+
+test("切到没存滚轮方向的旧配置时回到标准，不沿用上一台的反向", () => {
+    const old = {active: null, profiles: [{name: "旧", settings: {serial: {port: "COM3"}}}]};
+    const current = config({serial: {port: "COM5", baudRate: 115200, mouseMode: "absolute", scrollDirection: "reverse"}});
+    const result = Profiles.apply(old, "旧", current);
+    assert.strictEqual(result.settings.serial.scrollDirection, "normal");
 });
 
 test("继电器跟着配置走", () => {

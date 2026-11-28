@@ -3,7 +3,12 @@
 //! 这里刻意不认识 CH9329 协议——组帧、校验、ACK、波特率探测全在浏览器的
 //! `ch9329.js` 里。服务端只保证两件事：口是我开的（独占、能换波特率），
 //! 字节原样进出。唯一的例外是断线松键的兜底包，见 `RELEASE_FRAMES`。
+//!
+//! 另一个例外是假端口 `usb-gadget`：选它时不开串口，字节交给服务端的 CH9329 模拟器
+//! （`hid_emulator`），翻成 HID 报告写进本机 USB 口的 `/dev/hidg*`。浏览器那边分不出来。
 
+use crate::hid_emulator::{Emulator, HidTarget};
+use crate::usb_gadget::UsbGadget;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self as blocking_mpsc, RecvTimeoutError};
@@ -79,6 +84,9 @@ const TAKEOVER_WAIT: Duration = Duration::from_secs(5);
 // ---------------------------------------------------------------------------
 // 串口枚举
 // ---------------------------------------------------------------------------
+
+/// 本机 USB 口直连的假端口名。配置里存的就是它，所以切换机器配置、安卓客户端都不用改。
+pub const GADGET_PORT: &str = "usb-gadget";
 
 #[derive(Serialize)]
 pub struct PortInfo {
@@ -191,6 +199,34 @@ impl SerialLink {
         ))
     }
 
+    fn open_gadget(gadget: Arc<UsbGadget>, baud_rate: u32) -> Result<(Self, mpsc::Receiver<Bytes>)> {
+        let (write_tx, write_rx) = blocking_mpsc::channel::<Bytes>();
+        let (read_tx, read_rx) = mpsc::channel::<Bytes>(64);
+        let (done_tx, done_rx) = oneshot::channel();
+        let round_trip_us = Arc::new(AtomicU64::new(0));
+        let thread_round_trip = round_trip_us.clone();
+        std::thread::Builder::new()
+            .name("serial-usb-gadget".into())
+            .spawn(move || {
+                emulate(&gadget, write_rx, read_tx, &thread_round_trip);
+                info!("本机 USB 口键鼠已关闭");
+                let _ = done_tx.send(());
+            })
+            .context("启动 USB 口键鼠线程失败")?;
+        info!("本机 USB 口键鼠已打开");
+        Ok((
+            Self {
+                port: GADGET_PORT.to_string(),
+                // 原样报回去：ch9329.js 拿它当「探测成功的波特率」记着，没有别的用处
+                baud_rate,
+                writes: write_tx,
+                finished: done_rx,
+                round_trip_us,
+            },
+            read_rx,
+        ))
+    }
+
     /// 返回 false 表示串口线程已经不在了。
     fn write(&self, bytes: Bytes) -> bool {
         self.writes.send(bytes).is_ok()
@@ -259,6 +295,40 @@ fn pump(
         debug!("RX {}", hex(&buf[..read]));
         if reads.blocking_send(Bytes::copy_from_slice(&buf[..read])).is_err() {
             return Ok(());
+        }
+    }
+}
+
+/// 直连口的线程体，对应真串口的 `pump`。没有包间隔、没有轮询：模拟器自己组帧，应答
+/// 当场就有。被控机没接时报告写不进去，照样回成功——真 CH9329 没接被控机时也是这样，
+/// 查信息时的 USB 状态会如实报未连接。
+fn emulate(
+    gadget: &UsbGadget,
+    writes: blocking_mpsc::Receiver<Bytes>,
+    reads: mpsc::Sender<Bytes>,
+    round_trip_us: &AtomicU64,
+) {
+    let mut emulator = Emulator::new();
+    while let Ok(bytes) = writes.recv() {
+        let started = Instant::now();
+        let output = emulator.feed(&bytes, &mut || gadget.status());
+        write_reports(gadget, &output.reports);
+        if output.replies.is_empty() {
+            continue;
+        }
+        round_trip_us.store(started.elapsed().as_micros().max(1) as u64, Ordering::Relaxed);
+        if reads.blocking_send(Bytes::from(output.replies)).is_err() {
+            break;
+        }
+    }
+    // 浏览器断开时发的全释放帧管不到绝对鼠标，这里补上，否则被控机上的键会一直按着
+    write_reports(gadget, &emulator.release_reports());
+}
+
+fn write_reports(gadget: &UsbGadget, reports: &[(HidTarget, Vec<u8>)]) {
+    for (target, report) in reports {
+        if let Err(error) = gadget.write_report(*target, report) {
+            debug!("HID 报告没写进去（被控机没接或没在听）：{error}");
         }
     }
 }
@@ -352,6 +422,8 @@ pub struct SerialHub {
     /// 了：我这边一个自动连接的标签页占了串口一小时，另一头反复重试十几次，
     /// 每次只收到「请先关掉那个标签页」，而那个标签页他压根碰不到。
     evict: std::sync::Mutex<Option<Arc<Notify>>>,
+    /// 本机 USB 口可用时才有，`usb-gadget` 这个假端口靠它打开。
+    gadget: Option<Arc<UsbGadget>>,
 }
 
 /// 持有期间代表控制权。drop 时把座位和退位信号一起交还。
@@ -372,11 +444,25 @@ impl Drop for ControlSeat {
 }
 
 impl SerialHub {
-    pub fn new() -> Arc<Self> {
+    pub fn new(gadget: Option<Arc<UsbGadget>>) -> Arc<Self> {
         Arc::new(Self {
             seat: Arc::new(tokio::sync::Mutex::new(())),
             evict: std::sync::Mutex::new(None),
+            gadget,
         })
+    }
+
+    /// 串口列表里加上直连口。放最前面：接了这根线的人多半就是想用它。
+    pub fn add_gadget_port(&self, ports: &mut Vec<PortInfo>) {
+        if self.gadget.is_some() {
+            ports.insert(
+                0,
+                PortInfo {
+                    name: GADGET_PORT.to_string(),
+                    description: Some("本机 USB 口直连（不需要 CH9329）".to_string()),
+                },
+            );
+        }
     }
 
     /// 取得控制权，拿不到返回 `None`。`takeover` 为真时先请现任退位。
@@ -503,7 +589,7 @@ pub async fn handle(socket: WebSocket, hub: Arc<SerialHub>, takeover: bool) {
                                     rx = None;
                                     old.shutdown().await;
                                 }
-                                match open_port(port, baud_rate).await {
+                                match open_port(port, baud_rate, hub.gadget.clone()).await {
                                     Ok((active, reads)) => {
                                         let status = ServerOp::Status {
                                             open: true,
@@ -578,7 +664,15 @@ async fn recv_serial(rx: &mut Option<mpsc::Receiver<Bytes>>) -> Option<Bytes> {
 
 /// `SerialLink::open` 里的打开动作是阻塞的（Windows 上偶尔要等几百毫秒），
 /// 不能直接压在 tokio 的 worker 线程上。
-async fn open_port(port: String, baud_rate: u32) -> Result<(SerialLink, mpsc::Receiver<Bytes>)> {
+async fn open_port(
+    port: String,
+    baud_rate: u32,
+    gadget: Option<Arc<UsbGadget>>,
+) -> Result<(SerialLink, mpsc::Receiver<Bytes>)> {
+    if port == GADGET_PORT {
+        let gadget = gadget.context("本机 USB 口不可用，原因见设置页「键鼠」一节")?;
+        return SerialLink::open_gadget(gadget, baud_rate);
+    }
     let opening = tokio::task::spawn_blocking(move || SerialLink::open(&port, baud_rate));
     tokio::time::timeout(OPEN_TIMEOUT, opening)
         .await
@@ -609,4 +703,59 @@ fn release_all(link: &SerialLink) {
         link.write(Bytes::from(frame));
     }
     info!("控制端断开，已下发全释放包");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usb_gadget::{ABS_MOUSE_FUNCTION, KEYBOARD_FUNCTION, test_support};
+
+    #[test]
+    fn 直连口把键盘帧写成_hid_报告并回应答() {
+        let (fixture, gadget) = test_support::gadget();
+        let (link, mut replies) = SerialLink::open_gadget(gadget, 9600).unwrap();
+        let frame = [0x57, 0xAB, 0x00, 0x02, 0x08, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0, 0x10];
+        assert!(link.write(Bytes::copy_from_slice(&frame)));
+        let reply = replies.blocking_recv().unwrap();
+        assert_eq!(&reply[..], &[0x57, 0xAB, 0x00, 0x82, 0x01, 0x00, 0x85]);
+        let node = fixture.paths.hid_node(KEYBOARD_FUNCTION).unwrap();
+        assert_eq!(std::fs::read(node).unwrap(), vec![0, 0, 0x04, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn 写通道关闭时补发绝对鼠标的松键报告() {
+        let (fixture, gadget) = test_support::gadget();
+        let (link, mut replies) = SerialLink::open_gadget(gadget, 9600).unwrap();
+        let mut frame = vec![0x57, 0xAB, 0x00, 0x04, 0x07, 0x02, 0x01, 0xFF, 0x0F, 0x00, 0x08, 0x00];
+        let sum = frame.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        frame.push(sum);
+        assert!(link.write(Bytes::from(frame)));
+        replies.blocking_recv().unwrap();
+
+        let SerialLink { writes, finished, .. } = link;
+        drop(writes);
+        finished.blocking_recv().unwrap();
+
+        let node = fixture.paths.hid_node(ABS_MOUSE_FUNCTION).unwrap();
+        assert_eq!(
+            std::fs::read(node).unwrap(),
+            vec![0x01, 0xFF, 0x0F, 0x00, 0x08, 0x00, 0x00, 0xFF, 0x0F, 0x00, 0x08, 0x00]
+        );
+    }
+
+    #[test]
+    fn 有_gadget_时串口列表最前面多一项() {
+        let (_fixture, gadget) = test_support::gadget();
+        let mut ports = vec![PortInfo {
+            name: "/dev/ttyUSB0".into(),
+            description: None,
+        }];
+        SerialHub::new(Some(gadget)).add_gadget_port(&mut ports);
+        assert_eq!(ports[0].name, GADGET_PORT);
+        assert_eq!(ports.len(), 2);
+
+        let mut ports = Vec::new();
+        SerialHub::new(None).add_gadget_port(&mut ports);
+        assert!(ports.is_empty());
+    }
 }

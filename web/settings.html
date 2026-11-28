@@ -4,6 +4,9 @@
     <meta charset="utf-8">
     <title>rust-kvm 设置</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
     <link rel="stylesheet" href="theme.css">
     <script src="theme.js"></script>
     <style>
@@ -299,6 +302,7 @@
     <section>
         <h2>键鼠</h2>
         <div class="problem" id="serial-problem"></div>
+        <p class="hint" id="gadget-hint" hidden></p>
         <div class="field">
             <label for="serial-port">串口</label>
             <select id="serial-port"></select>
@@ -310,11 +314,19 @@
                 <option value="relative">相对（需要 Pointer Lock，适合游戏）</option>
             </select>
         </div>
+        <div class="field">
+            <label for="scroll-direction">滚轮方向</label>
+            <select id="scroll-direction">
+                <option value="normal">标准（Windows、Linux）</option>
+                <option value="reverse">反向（被控机是开了自然滚动的 Mac）</option>
+            </select>
+        </div>
         <p class="hint">串口不热切换，下次在控制页点「连接键鼠」时生效。
-            相对模式需要芯片工作在模式 2，否则某些被控端点不动。</p>
+            相对模式需要芯片工作在模式 2，否则某些被控端点不动。
+            滚轮方向看的是被控机：被控机滚反了就换一下，回到控制页就生效。</p>
     </section>
 
-    <section>
+    <section id="chip-section">
         <h2>CH9329 芯片</h2>
         <p class="hint">这一节直接读写芯片，要临时借用串口——别处正连着时会问你要不要
             接管。<strong>写入后都要把 CH9329 断电重插（拔掉 USB 再插回）才生效。</strong></p>
@@ -375,6 +387,7 @@
 <script src="profiles.js"></script>
 <script src="atx.js"></script>
 <script src="capture-modes.js"></script>
+<script src="usb-media.js"></script>
 <script src="settings-page.js"></script>
 </body>
 </html>

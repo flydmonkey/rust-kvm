@@ -53,7 +53,8 @@
         if (!target || !target.tagName) {
             return false;
         }
-        return target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+        return target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT"
+            || target.isContentEditable;
     }
 
     function inToolPanel(target) {
@@ -177,6 +178,9 @@
         let ports = [];
         try {
             const response = await fetch("/api/serial/ports", {cache: "no-store"});
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
             ports = await response.json();
         } catch (e) {
             if (!quiet) {
@@ -616,7 +620,8 @@
             }
             wheelPixels -= notches * WHEEL_PIXELS_PER_NOTCH;
             // 浏览器 deltaY 向下为正，协议齿数向上为正
-            ch.mouseScroll(-notches);
+            const reverse = settings && settings.serial.scrollDirection === "reverse";
+            ch.mouseScroll(reverse ? notches : -notches);
         }, {passive: true});
 
         // 每个事件直接下发，中间不再加一层合并。限流由 ch9329.js 的发送队列
@@ -816,11 +821,58 @@
         }
     };
 
+    // 离开页面就把串口还回去。整页跳转**不等于**卸载：浏览器会把这页连同开着的
+    // WebSocket 一起冻进往返缓存，座位就一直被一个没人能操作的页面占着——设置页
+    // 借不到芯片，从设置页点「返回控制页」新开的那一页也被拒，要等浏览器自己把
+    // 缓存清掉（实测近三分钟）才放。
+    //
+    // 必须全同步：pagehide 之后页面随时会被冻住，`teardown` 里那个 await 之后的
+    // 部分不一定跑得到。
+    window.addEventListener("pagehide", () => {
+        cancelReconnect();
+        if (ch) {
+            try {
+                ch.forceReleaseAllInput();
+            } catch (e) {
+            }
+            ch.dispose();
+            ch = null;
+        }
+        if (port) {
+            port.dispose();
+            port = null;
+        }
+        chipInfo = null;
+        baudRate = null;
+        baudProbed = false;
+        serialLost = false;
+        busy = false;
+        renderStatus();
+    });
+
+    // 从往返缓存回来（浏览器的后退）时上面已经把串口放了，照打开页面那样再连一次。
+    // 正连着一半被冻住的那次不用管：它醒来后会自己建新连接接着探测。
+    window.addEventListener("pageshow", (event) => {
+        if (!event.persisted || connecting) {
+            return;
+        }
+        portName = null;
+        loadSettings()
+            .then(() => resolvePort())
+            .then(autoConnect)
+            .catch((error) => {
+                renderStatus({
+                    level: "error",
+                    lines: ["自动连接失败", String(error.message || error), "点击重试"]
+                });
+            });
+    });
+
     // 打开页面就连。原来要手点一下，但那一下没有任何信息量——串口和鼠标模式都在
     // 配置里，点与不点的结果完全一样。连不上也没关系：图标变红写明原因，再点就重试。
     //
-    // 有个副作用要知道：控制页一开着就占着串口，设置页那节「读写芯片」借不到。
-    // 不过从工具栏点「设置」是整页跳转，控制页卸载时串口就放了，所以那条路还是通的。
+    // 控制页开着就占着串口，设置页那节「读写芯片」借不到；靠上面的 pagehide，
+    // 从工具栏点「设置」跳过去时串口已经放了。
     async function autoConnect() {
         if (!portName) {
             // resolvePort 已经把原因写在图标上了（没串口 / 读不到列表）

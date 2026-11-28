@@ -246,6 +246,16 @@ async function start() {
         [offscreen]
     );
 
+    // 去设置页这页并不卸载，而是连同 WebSocket 一起冻进往返缓存：连接开着却没人读，
+    // 服务端照样往里推，采集卡也一直算「有人在看」。连接在 Worker 里，这里只能发个
+    // 消息让它关——Worker 来不及处理就被冻住的话，服务端的发送超时会把它断掉。
+    window.addEventListener("pagehide", () => worker.postMessage({type: "pause"}));
+    window.addEventListener("pageshow", (event) => {
+        if (event.persisted) {
+            worker.postMessage({type: "resume"});
+        }
+    });
+
     pollServerStats();
     setInterval(pollServerStats, STATS_POLL_MS);
 }

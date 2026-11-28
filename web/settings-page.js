@@ -37,6 +37,7 @@
     const serialPort = el("serial-port");
     const serialBaud = el("serial-baud");
     const mouseMode = el("mouse-mode");
+    const scrollDirection = el("scroll-direction");
     const workingMode = el("working-mode");
     const atxPort = el("atx-port");
     const atxChannel = el("atx-channel");
@@ -46,6 +47,13 @@
     const saveStatus = el("save-status");
     const chipStatus = el("chip-status");
     const chipButtons = [el("chip-read"), el("chip-baud"), el("chip-mode"), el("chip-reset")];
+    // 本机 USB 口直连的假端口。选它时没有芯片可读写，芯片那一节整个藏起来
+    const GADGET_PORT = "usb-gadget";
+    const chipSection = el("chip-section");
+
+    function renderChipSection() {
+        chipSection.hidden = serialPort.value === GADGET_PORT;
+    }
 
     let config = null;
 
@@ -136,10 +144,12 @@
         showProblem("serial-problem", devices.serial.error);
 
         fill(atxPort, [{value: "", label: "不使用"}].concat(
-            devices.serial.items.map((item) => ({
-                value: item.name,
-                label: item.description ? `${item.name} — ${item.description}` : item.name
-            }))
+            devices.serial.items
+                .filter((item) => item.name !== GADGET_PORT)
+                .map((item) => ({
+                    value: item.name,
+                    label: item.description ? `${item.name} — ${item.description}` : item.name
+                }))
         ));
     }
 
@@ -175,8 +185,10 @@
         audioNarrowband.checked = config.audio.narrowband;
 
         selectOrKeep(serialPort, config.serial.port);
+        renderChipSection();
         selectOrKeep(serialBaud, String(config.serial.baudRate));
         mouseMode.value = config.serial.mouseMode;
+        scrollDirection.value = config.serial.scrollDirection === "reverse" ? "reverse" : "normal";
 
         const atx = Atx.normalize(config.atx);
         atxPort.value = "";
@@ -211,7 +223,8 @@
             serial: {
                 port: serialPort.value,
                 baudRate: Number(serialBaud.value),
-                mouseMode: mouseMode.value
+                mouseMode: mouseMode.value,
+                scrollDirection: scrollDirection.value
             },
             atx: Atx.normalize({
                 port: atxPort.value,
@@ -226,7 +239,13 @@
         saveStatus.className = "";
         try {
             const [devices, current] = await Promise.all([
-                fetch("/api/devices", {cache: "no-store"}).then((r) => r.json()),
+                fetch("/api/devices", {cache: "no-store"}).then(async (r) => {
+                    // 枚举超时回的是一句人话，不是 JSON
+                    if (!r.ok) {
+                        throw new Error(await r.text());
+                    }
+                    return r.json();
+                }),
                 fetch("/api/config", {cache: "no-store"}).then((r) => r.json())
             ]);
             config = current;
@@ -234,10 +253,22 @@
             // 顺序要紧：先铺列表再套配置，否则 selectOrKeep 插的占位项会被冲掉
             renderConfig();
             loadCapabilities();
+            loadGadgetHint();
         } catch (e) {
             saveStatus.textContent = `读不到设备或配置：${e.message || e}`;
             saveStatus.className = "error";
         }
+    }
+
+    async function loadGadgetHint() {
+        const hint = el("gadget-hint");
+        try {
+            const response = await fetch("/api/usb", {cache: "no-store"});
+            hint.textContent = response.ok ? UsbMedia.unavailableHint(await response.json()) : "";
+        } catch (e) {
+            hint.textContent = "";
+        }
+        hint.hidden = !hint.textContent;
     }
 
     async function putConfig(next) {
@@ -906,6 +937,7 @@
         Atx.CHANNELS.map((n) => ({value: String(n), label: `第 ${n} 路`}))
     ));
     atxPort.addEventListener("change", renderAtxState);
+    serialPort.addEventListener("change", renderChipSection);
     atxChannel.addEventListener("change", renderAtxState);
 
     videoCodec.addEventListener("change", renderBitrateState);

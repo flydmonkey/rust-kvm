@@ -692,6 +692,7 @@ fn capture_loop(hub: &VideoHub) -> Result<StopReason> {
         config.fps,
     );
     let request = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(wanted));
+    crate::camera::settle_frame_interval(&index, config.fps);
     let mut camera =
         Camera::new(index, request).context("打开采集卡失败（是否被别的程序占用？）")?;
 
@@ -895,6 +896,7 @@ fn sample_fps(index: CameraIndex, width: u32, height: u32, fps: u32) -> Result<u
         FrameFormat::MJPEG,
         fps.max(1),
     );
+    crate::camera::settle_frame_interval(&index, fps);
     let mut camera = Camera::new(
         index,
         RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(wanted)),

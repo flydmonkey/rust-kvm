@@ -9,13 +9,19 @@ mod camera;
 mod certs;
 mod config;
 mod devices;
+#[cfg(target_os = "linux")]
+mod gadget_setup;
 mod h264;
+mod hid_emulator;
+mod media;
 mod nv12;
 mod serial_bridge;
 #[cfg(windows)]
 mod service;
 #[cfg(target_os = "linux")]
 mod systemd;
+mod usb_api;
+mod usb_gadget;
 mod video;
 
 use std::net::SocketAddr;
@@ -44,6 +50,7 @@ use audio::{AudioHub, AudioStats};
 use config::{Config, ConfigStore};
 use devices::Devices;
 use serial_bridge::{PortInfo, SerialHub};
+use usb_gadget::{Availability, GadgetPaths};
 use video::{VideoCodec, VideoHub, VideoStats};
 
 /// 局域网访问走这个口，必须是 HTTPS：Keyboard Lock、剪贴板、Pointer Lock
@@ -92,6 +99,8 @@ const USAGE: &str = "\
   sudo rust-kvm start       启动服务
   sudo rust-kvm stop        停止服务
   rust-kvm status           看服务状态和日志位置
+  rust-kvm usb-gadget-setup <用户>
+                            建本机 USB 口的 gadget（ARM 板上 systemd 启动前自动跑，不用手动）
 
 服务以执行 install 的那个用户身份跑，附加 video / audio / dialout 组并允许实时
 优先级——前台跑时设备权限来自登录会话，服务里没有那一层。";
@@ -139,6 +148,7 @@ fn run_command(command: &str) -> Result<()> {
         "start" => systemd::start(),
         "stop" => systemd::stop(),
         "status" => systemd::status(),
+        "usb-gadget-setup" => gadget_setup::run(std::env::args().nth(2).as_deref()),
         other => {
             eprintln!("未知命令：{other}\n\n{USAGE}");
             std::process::exit(2);
@@ -185,11 +195,16 @@ pub(crate) fn init_logging(file: Option<&std::path::Path>) -> Result<()> {
 
 /// 服务模式下 `main` 已经不是 async 了（SCM 要先握手再干活），运行时得自己建。
 pub(crate) fn block_on_server(handle: ServerHandle) -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("建 tokio 运行时失败")?
-        .block_on(run_server(handle))
+        .context("建 tokio 运行时失败")?;
+    let outcome = runtime.block_on(run_server(handle));
+    // 直接 drop 会无限期等所有 blocking 线程：卡在驱动里的枚举、堵在 frame_raw 上
+    // 的采集都回不来，进程就停不下，systemd 等满超时再 SIGKILL。该收的尾（全释放
+    // 包）在 run_server 返回前已经做完了。
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    outcome
 }
 
 async fn run_server(handle: ServerHandle) -> Result<()> {
@@ -202,10 +217,36 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
     let store = Arc::new(ConfigStore::load(&root.join("config.json")));
     let settings = store.get();
 
+    let usb = usb_gadget::detect(&GadgetPaths::system(), std::env::consts::ARCH);
+    let gadget = match &usb {
+        Availability::Ready(gadget) => {
+            info!("本机 USB 口可用：虚拟光驱、U 盘和直连键鼠");
+            gadget.spawn_led_reader();
+            Some(gadget.clone())
+        }
+        Availability::Unavailable(reason) => {
+            warn!("本机 USB 口不可用：{reason}");
+            None
+        }
+        Availability::Unsupported => None,
+    };
+
+    // 只在可用时建目录：x86 上不该凭空多出一个 images/
+    let image_root = root.join(media::DIR_NAME);
+    if gadget.is_some()
+        && let Err(error) = std::fs::create_dir_all(&image_root)
+    {
+        warn!("建镜像目录 {} 失败：{error}", image_root.display());
+    }
+    // 规范化之后再交出去：写进 configfs 的必须是绝对路径，软链接也要解开，
+    // 否则槽里读回来的路径和这里拼出来的对不上，概览里就显示成全路径
+    let image_root = image_root.canonicalize().unwrap_or(image_root);
+    let usb_service = usb_api::UsbService::new(&usb, media::ImageDir::new(image_root));
+
     let state = AppState {
         hub: VideoHub::new(settings.video),
         audio: AudioHub::new(settings.audio),
-        serial: SerialHub::new(),
+        serial: SerialHub::new(gadget),
         atx: AtxRelay::new(),
         config: store,
         cert_pem: Arc::new(cert.cert_pem),
@@ -225,6 +266,7 @@ async fn run_server(handle: ServerHandle) -> Result<()> {
         .route("/api/atx/press", post(atx_press))
         .route("/api/atx/release", post(atx_release))
         .route("/cert.crt", get(download_cert))
+        .merge(usb_api::router(usb_service))
         .fallback_service(ServeDir::new(root.join("web")))
         .layer(axum::middleware::map_response(no_cache))
         .with_state(state);
@@ -396,10 +438,29 @@ async fn send_codec_header(
     if let Some(reason) = &state.fallback_reason {
         header["fallbackReason"] = serde_json::json!(reason);
     }
-    sender
-        .send(Message::Text(header.to_string().into()))
-        .await
-        .map_err(|_| ())
+    send_within(sender, Message::Text(header.to_string().into())).await
+}
+
+/// 一条消息这么久还发不出去，就当对面已经不读了。
+///
+/// TCP 不会替我们发现这种连接：浏览器把页面冻进往返缓存、标签页被挂起时，连接
+/// 好好的，只是接收窗口归零，send 就永远停在那儿。推流任务跟着停住，订阅却还在，
+/// 于是采集卡一直「有人在看」，设置页里观看者也多出一个。实测一条这样的连接积了
+/// 3 MB 没人读。10 秒对慢网也够：最大的 1080p JPEG 七百来 KB，1 Mbps 也只要六秒。
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn send_within(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+) -> Result<(), ()> {
+    match tokio::time::timeout(SEND_TIMEOUT, sender.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            info!("客户端 {} 秒没有读数据，断开", SEND_TIMEOUT.as_secs());
+            Err(())
+        }
+    }
 }
 
 /// 配置变了就返回，让外层重发头。
@@ -438,7 +499,7 @@ async fn pump_mjpeg(
             // 静止时这条是唯一的出口，所以它也兼任「连接还在」的心跳
             _ = tokio::time::sleep_until(next_notice) => {
                 let notice = serde_json::json!({"op": "idle", "skipped": skipped_duplicates});
-                if sender.send(Message::Text(notice.to_string().into())).await.is_err() {
+                if send_within(sender, Message::Text(notice.to_string().into())).await.is_err() {
                     return Err(());
                 }
                 next_notice = tokio::time::Instant::now() + IDLE_NOTICE;
@@ -455,7 +516,7 @@ async fn pump_mjpeg(
                     hub.record_sent(frame.len());
                     // send 会在客户端慢的时候等着，这期间 broadcast 那头会积压
                     // 并触发下面的 Lagged，正好实现「慢客户端丢帧」。
-                    if sender.send(Message::Binary(frame)).await.is_err() {
+                    if send_within(sender, Message::Binary(frame)).await.is_err() {
                         return Err(());
                     }
                 }
@@ -491,7 +552,7 @@ async fn pump_h264(
                         waiting_for_keyframe = false;
                     }
                     hub.record_sent(packet.data.len());
-                    if sender.send(Message::Binary(packet.data)).await.is_err() {
+                    if send_within(sender, Message::Binary(packet.data)).await.is_err() {
                         return Err(());
                     }
                 }
@@ -521,8 +582,50 @@ struct DeviceQuery {
 }
 
 /// 能力表。Linux 上只枚举，不打断正在进行的采集。
-async fn video_capabilities(Query(query): Query<DeviceQuery>) -> Json<video::CaptureCapabilities> {
-    Json(video::list_capabilities(&query.device))
+async fn video_capabilities(Query(query): Query<DeviceQuery>) -> Response {
+    match enumerate(move || video::list_capabilities(&query.device)).await {
+        Ok(capabilities) => Json(capabilities).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// 枚举设备要一路问进驱动。USB 正在出错时（采集卡报 -71、ALSA 报 Host is down）
+/// 这一问可能一直不回来，压在 tokio 的 worker 上的话卡一次少一个线程，设置页多
+/// 进几次整个服务就不再响应——页面、画面、键鼠一起没了，而 systemd 看它还活着。
+const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 放到 blocking 线程上跑，等不到就先回话。卡住的那个线程留在原地，回不来也只是
+/// 它自己。
+async fn enumerate<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    enumerate_within(ENUMERATE_TIMEOUT, work).await
+}
+
+async fn enumerate_within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    use axum::http::StatusCode;
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("枚举设备的线程异常退出: {error}"),
+        )
+            .into_response()),
+        Err(_) => {
+            warn!("枚举设备 {:?} 没有返回", limit);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "枚举设备 {} 秒没有返回，多半是某个 USB 设备正在出错。重新插拔或者换个口再试",
+                    limit.as_secs()
+                ),
+            )
+                .into_response())
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -605,7 +708,7 @@ async fn stream_audio(socket: WebSocket, hub: Arc<AudioHub>) {
             Err(message) => {
                 info!("音频开不起来: {message}");
                 let payload = serde_json::json!({"op": "error", "message": message});
-                let _ = sender.send(Message::Text(payload.to_string().into())).await;
+                let _ = send_within(&mut sender, Message::Text(payload.to_string().into())).await;
                 break;
             }
         };
@@ -617,8 +720,7 @@ async fn stream_audio(socket: WebSocket, hub: Arc<AudioHub>) {
                 "channels": format.channels,
                 "format": "s16le",
             });
-            if sender
-                .send(Message::Text(header.to_string().into()))
+            if send_within(&mut sender, Message::Text(header.to_string().into()))
                 .await
                 .is_err()
             {
@@ -660,7 +762,7 @@ async fn pump_audio(
             _ = format_rx.changed() => return PumpEnd::FormatChanged,
             chunk = chunks.recv() => match chunk {
                 Ok(chunk) => {
-                    if sender.send(Message::Binary(chunk)).await.is_err() {
+                    if send_within(sender, Message::Binary(chunk)).await.is_err() {
                         return PumpEnd::Done;
                     }
                 }
@@ -743,14 +845,24 @@ async fn no_cache(mut response: Response) -> Response {
 }
 
 /// 远程浏览器没有宿主机的 Web Serial 权限，选口只能靠服务端枚举。
-async fn serial_ports() -> Json<Vec<PortInfo>> {
-    Json(serial_bridge::list_ports())
+async fn serial_ports(State(state): State<AppState>) -> Response {
+    let mut ports: Vec<PortInfo> = match enumerate(serial_bridge::list_ports).await {
+        Ok(ports) => ports,
+        Err(response) => return response,
+    };
+    state.serial.add_gadget_port(&mut ports);
+    Json(ports).into_response()
 }
 
 /// 每次请求都重新枚举，不缓存：设备是会被插拔的，而设置页上那个列表过期了
 /// 就直接导致选不到设备。
-async fn list_devices() -> Json<Devices> {
-    Json(devices::enumerate())
+async fn list_devices(State(state): State<AppState>) -> Response {
+    let mut devices: Devices = match enumerate(devices::enumerate).await {
+        Ok(devices) => devices,
+        Err(response) => return response,
+    };
+    state.serial.add_gadget_port(&mut devices.serial.items);
+    Json(devices).into_response()
 }
 
 async fn get_config(State(state): State<AppState>) -> Json<Config> {
@@ -773,6 +885,17 @@ async fn put_config(
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "继电器和 CH9329 不能是同一个串口",
+        )
+            .into_response());
+    }
+    if config
+        .atx
+        .as_ref()
+        .is_some_and(|relay| relay.port == serial_bridge::GADGET_PORT)
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "继电器要接真串口，不能选本机 USB 口",
         )
             .into_response());
     }
@@ -855,4 +978,31 @@ pub(crate) fn asset_root() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use axum::http::StatusCode;
+
+    use super::enumerate_within;
+
+    #[tokio::test]
+    async fn 枚举卡住时按时回_503_而不是一直等() {
+        let started = Instant::now();
+        let outcome = enumerate_within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(2));
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let response = outcome.expect_err("应该超时");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn 枚举正常返回时原样交出结果() {
+        let ports = enumerate_within(Duration::from_secs(1), || vec!["/dev/ttyACM0"]).await;
+        assert_eq!(ports.ok(), Some(vec!["/dev/ttyACM0"]));
+    }
 }

@@ -94,6 +94,9 @@ pub struct SerialSettings {
     pub baud_rate: u32,
     /// `absolute` 或 `relative`
     pub mouse_mode: String,
+    /// `normal` 或 `reverse`。被控机是开了「自然滚动」的 Mac 时，它会把 USB 滚轮
+    /// 再翻一次，和控制端的手感正好相反，这时选 `reverse`。看的是被控机，不是控制端
+    pub scroll_direction: String,
 }
 
 impl Default for SerialSettings {
@@ -102,6 +105,7 @@ impl Default for SerialSettings {
             port: String::new(),
             baud_rate: 115200,
             mouse_mode: "absolute".to_string(),
+            scroll_direction: "normal".to_string(),
         }
     }
 }

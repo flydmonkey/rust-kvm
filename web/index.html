@@ -4,6 +4,9 @@
     <meta charset="utf-8">
     <title>rust-kvm</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
     <link rel="stylesheet" href="theme.css">
     <script src="theme.js"></script>
     <style>
@@ -453,6 +456,64 @@
             font-size: 12px;
         }
 
+        .media-slot {
+            display: grid;
+            grid-template-columns: 3em 1fr auto auto;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .media-slot select {
+            min-width: 0;
+        }
+
+        .media-state {
+            grid-column: 2 / -1;
+            color: var(--text-muted);
+            font-size: 12px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .media-image {
+            display: grid;
+            grid-template-columns: 1fr auto auto;
+            gap: 8px;
+            align-items: center;
+            font-size: 13px;
+        }
+
+        .media-image span:first-child {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .media-size {
+            color: var(--text-muted);
+        }
+
+        #media-panel button:not(#media-close) {
+            padding: 4px 8px;
+            border: 1px solid var(--tint-10);
+            border-radius: 6px;
+            background: var(--tint-04);
+        }
+
+        #media-panel button:not(#media-close):hover:not(:disabled) {
+            background: var(--tint-12);
+        }
+
+        #media-panel button:disabled {
+            cursor: default;
+            opacity: 0.6;
+        }
+
+        #media-progress {
+            width: 100%;
+        }
+
         .atx-actions {
             display: flex;
             flex-direction: column;
@@ -493,6 +554,7 @@
 
         #view-close,
         #atx-close,
+        #media-close,
         #profile-close,
         #shortcut-close,
         #ocr-close {
@@ -506,6 +568,7 @@
 
         #view-close:hover,
         #atx-close:hover,
+        #media-close:hover,
         #profile-close:hover,
         #shortcut-close:hover,
         #ocr-close:hover {
@@ -807,6 +870,16 @@ Win+L、Alt+Tab、BIOS 热键等
 
     <div class="toolbar-divider"></div>
 
+    <button id="media" type="button" aria-label="虚拟介质" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"/>
+            <circle cx="12" cy="12" r="2.5"/>
+        </svg>
+        <span class="tooltip">虚拟介质
+本机 USB 口上的光驱和 U 盘
+只在支持的 ARM 板上出现</span>
+    </button>
     <button id="atx" type="button" aria-label="ATX 电源" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
              stroke-linejoin="round" aria-hidden="true">
@@ -866,6 +939,34 @@ Win+L、Alt+Tab、BIOS 热键等
     </div>
     <div id="view-options" class="profile-list"></div>
     <p class="shortcut-hint">放大时画面跟着鼠标走，指针下面就是被控端的那一点。</p>
+</div>
+
+<div id="media-panel" class="tool-panel" data-toggle="media" hidden>
+    <div class="tool-panel-header">
+        <span>虚拟介质</span>
+        <button id="media-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="media-slot">
+        <span>光驱</span>
+        <select id="media-cdrom-image" aria-label="光驱镜像"></select>
+        <button id="media-cdrom-mount" type="button">挂载</button>
+        <button id="media-cdrom-eject" type="button">弹出</button>
+        <span class="media-state" id="media-cdrom-state"></span>
+    </div>
+    <div class="media-slot">
+        <span>U 盘</span>
+        <select id="media-disk-image" aria-label="U 盘镜像"></select>
+        <button id="media-disk-mount" type="button">挂载</button>
+        <button id="media-disk-eject" type="button">弹出</button>
+        <span class="media-state" id="media-disk-state"></span>
+    </div>
+    <label class="shortcut-repeat-row"><span>U 盘只读</span><input id="media-disk-ro" type="checkbox"></label>
+    <p class="shortcut-hint">镜像</p>
+    <div id="media-images" class="profile-list"></div>
+    <progress id="media-progress" max="1" value="0" hidden></progress>
+    <button id="media-upload" type="button">上传镜像</button>
+    <input id="media-file" type="file" accept=".iso,.img" hidden>
+    <p class="shortcut-hint">换盘不会让键鼠掉线。挂着的镜像不能删、不能覆盖。</p>
 </div>
 
 <div id="atx-panel" class="tool-panel" data-toggle="atx" hidden>
@@ -951,6 +1052,8 @@ Win+L、Alt+Tab、BIOS 热键等
 <script src="ocr-panel.js"></script>
 <script src="profiles.js"></script>
 <script src="profile-panel.js"></script>
+<script src="usb-media.js"></script>
+<script src="media-panel.js"></script>
 <script src="atx.js"></script>
 <script src="atx-panel.js"></script>
 </body>
